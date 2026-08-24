@@ -447,11 +447,22 @@ static void v2_process_block(void *instance, int16_t *lr, int frames) {
                 loop->lp_state_r += lp_a * (raw_r - loop->lp_state_r);
                 float filt_l = loop->lp_state_l, filt_r = loop->lp_state_r;
 
-                /* 2. Saturation (Warmth) */
+                /* 2. Saturation (Warmth) — crossfade between the dry
+                 * (filtered) signal and a FIXED full-drive tanh curve,
+                 * scaled by sat_amount, rather than modulating drive itself.
+                 * Modulating drive left a floor at drive=1 when sat_amount
+                 * was 0 (Warmth knob at minimum, OR a freshly-closed loop
+                 * where degrade≈0 regardless of the Warmth setting — sat_amount
+                 * is saturation*degrade), and tanh(x)/tanh(1) is not identity.
+                 * The crossfade makes sat_amount=0 an exact filt_l/filt_r
+                 * passthrough while sat_amount=1 reproduces the previous
+                 * full-drive behavior unchanged. */
                 float sat_amount = clampf(loop->saturation * degrade, 0.0f, 1.0f);
-                float drive = 1.0f + sat_amount * SATURATION_MAX_DRIVE;
-                float sat_l = tanhf(filt_l * drive) / tanhf(drive);
-                float sat_r = tanhf(filt_r * drive) / tanhf(drive);
+                float drive = 1.0f + SATURATION_MAX_DRIVE;
+                float driven_l = tanhf(filt_l * drive) / tanhf(drive);
+                float driven_r = tanhf(filt_r * drive) / tanhf(drive);
+                float sat_l = filt_l + (driven_l - filt_l) * sat_amount;
+                float sat_r = filt_r + (driven_r - filt_r) * sat_amount;
 
                 /* 3. Hiss */
                 float hiss_amount = clampf(loop->hiss * degrade, 0.0f, 1.0f) * HISS_CEILING;

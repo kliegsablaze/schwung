@@ -30,6 +30,9 @@
  *   7. master_loops_overview format (step 4) — the Master page's knob-6
  *      readout: all-idle, one loop Recording, and a fresh-close memory
  *      decile alongside a second loop Recording, each checked byte-exact.
+ *  16. saturation-stage passthrough: bit-exact identity at saturation=0
+ *      (nonzero degrade) and at degrade=0 (any saturation) — the bug fixed
+ *      in this same commit.
  *
  * Recordings closed deliberately via the buffer-full path (feed a full
  * buffer_seconds of continuous tone) rather than the silence-timeout path —
@@ -95,6 +98,18 @@ static void fill_silence(int16_t *buf, int frames) {
     memset(buf, 0, sizeof(int16_t) * 2 * (size_t)frames);
 }
 
+/* A constant (DC-ish) "tone" — used only by the saturation-passthrough test
+ * (test16), where a value that never changes sample-to-sample makes the
+ * recorded content immune to the debounce-triggered start-offset jitter that
+ * a real sine tone would carry: any window of a constant signal is identical
+ * regardless of exactly which sample write_head==0 landed on. */
+static void fill_constant(int16_t *buf, int frames, int16_t value) {
+    for (int i = 0; i < frames; i++) {
+        buf[i * 2]     = value;
+        buf[i * 2 + 1] = value;
+    }
+}
+
 static const char *status_of(audio_fx_api_v2_t *api, void *inst, char letter) {
     static char key[32];
     static char buf[64];
@@ -145,6 +160,17 @@ static void run_silence(audio_fx_api_v2_t *api, void *inst, long total_frames) {
     }
 }
 
+static void run_constant(audio_fx_api_v2_t *api, void *inst, long total_frames, int16_t value) {
+    int16_t buf[BLOCK_FRAMES * 2];
+    long remaining = total_frames;
+    while (remaining > 0) {
+        int n = remaining < BLOCK_FRAMES ? (int)remaining : BLOCK_FRAMES;
+        fill_constant(buf, n, value);
+        api->process_block(inst, buf, n);
+        remaining -= n;
+    }
+}
+
 /* Records a full buffer of tone into loop A (closes via buffer-full, not
  * silence-timeout) so recorded_length is exactly TEST_BUFFER_CAPACITY_FRAMES,
  * deterministically. total_frames only advances in whole BLOCK_FRAMES steps,
@@ -155,6 +181,15 @@ static void record_full_buffer_loop_a(audio_fx_api_v2_t *api, void *inst, float 
     api->set_param(inst, "input_routing", TEST_ROUTE_A);
     run_tone(api, inst, TEST_DEBOUNCE_FRAMES + TEST_BUFFER_CAPACITY_FRAMES + BLOCK_FRAMES * 8,
              0.5f, 440.0f, phase);
+}
+
+/* Constant-value counterpart of record_full_buffer_loop_a, for test16: fills
+ * the whole buffer with one unchanging sample value, so the recorded content
+ * is known exactly (`value`, every index) without needing to reconstruct the
+ * debounce-triggered start offset. */
+static void record_full_buffer_loop_a_constant(audio_fx_api_v2_t *api, void *inst, int16_t value) {
+    api->set_param(inst, "input_routing", TEST_ROUTE_A);
+    run_constant(api, inst, TEST_DEBOUNCE_FRAMES + TEST_BUFFER_CAPACITY_FRAMES + BLOCK_FRAMES * 8, value);
 }
 
 int main(void) {
@@ -496,6 +531,111 @@ int main(void) {
         api->destroy_instance(inst);
     }
 
+    /* ---- Test 16: saturation-stage passthrough — the fix in this commit.
+     * Before the fix, sat_amount==0 still ran tanhf(x*1.0f)/tanhf(1.0f),
+     * which is NOT identity — true both at the Warmth knob's literal minimum
+     * AND for a freshly-closed loop (degrade==0) regardless of the Warmth
+     * setting, since sat_amount = saturation * degrade. Uses a
+     * constant-value recording (not a sine tone) so the recorded content is
+     * known exactly without needing to reconstruct the debounce-triggered
+     * start offset, and drives every other degrade-scaled stage
+     * (wow/hf_loss/hiss/chaos) to zero — set AFTER the buffer-full close,
+     * since randomize_flavor() overwrites them at RECORDING->LOOPING — so
+     * the saturation stage's output is directly recoverable from
+     * process_block's output samples (dry fed as silence during
+     * measurement, so out == mix_dry_wet(0, wet) recovers wet to within
+     * int16 rounding). ---- */
+    {
+        const int16_t CONST_VALUE = 16000; /* well above record_threshold, no clipping headroom issues */
+        const float SAMPLE_F = (float)CONST_VALUE / 32768.0f;
+
+        /* ---- 16a: saturation == 0, at NONZERO degrade (one wrap in) ---- */
+        {
+            void *inst = api->create_instance(".", NULL);
+            check(inst != NULL, "test16a: create_instance");
+
+            api->set_param(inst, "loopA_decay_rate", "3");
+            record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
+            check(status_is_looping(status_of(api, inst, 'A')), "test16a: Looping after buffer-full close");
+
+            /* Set the isolation params AFTER the close (randomize_flavor
+             * already ran). wow=0 makes read speed exactly 1.0, so feeding
+             * exactly recorded_length (== TEST_BUFFER_CAPACITY_FRAMES)
+             * frames of silence advances read_head through EXACTLY one
+             * wrap, deterministically — memory afterward is exactly
+             * 1.0f - 1.0f/decay_rate, matching forgetful.c's own expression
+             * bit for bit. */
+            api->set_param(inst, "loopA_wow", "0");
+            api->set_param(inst, "loopA_hf_loss", "0");
+            api->set_param(inst, "loopA_hiss", "0");
+            api->set_param(inst, "loopA_chaos", "0");
+            api->set_param(inst, "loopA_saturation", "0");
+            api->set_param(inst, "loopA_volume", "1");
+
+            run_silence(api, inst, TEST_BUFFER_CAPACITY_FRAMES);
+            float expected_memory = 1.0f - 1.0f / 3.0f;
+            check(expected_memory > 0.0f && expected_memory < 1.0f, "test16a: sanity — degrade is nonzero here");
+
+            int16_t buf[BLOCK_FRAMES * 2];
+            fill_silence(buf, BLOCK_FRAMES);
+            api->process_block(inst, buf, BLOCK_FRAMES);
+
+            /* Expected: filt_l == SAMPLE_F exactly (hf_loss=0, constant
+             * content); sat_amount = saturation(0) * degrade(nonzero) == 0,
+             * so under the fix sat_l == filt_l exactly regardless of
+             * degrade. */
+            float expected_wet = SAMPLE_F * expected_memory; /* * loop_volume(1) */
+            int32_t expected_out = lroundf(expected_wet * 32767.0f);
+            int mismatch = 0;
+            for (int i = 0; i < BLOCK_FRAMES; i++) {
+                if (abs((int)buf[i * 2] - (int)expected_out) > 1) mismatch = 1;
+                if (abs((int)buf[i * 2 + 1] - (int)expected_out) > 1) mismatch = 1;
+            }
+            check(!mismatch,
+                  "test16a: saturation=0 is bit-exact identity even at nonzero degrade "
+                  "(within 1 LSB of independently-computed expected output)");
+
+            api->destroy_instance(inst);
+        }
+
+        /* ---- 16b: saturation == 1 (max), at ZERO degrade (freshly closed) ---- */
+        {
+            void *inst = api->create_instance(".", NULL);
+            check(inst != NULL, "test16b: create_instance");
+
+            record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
+            check(status_is_looping(status_of(api, inst, 'A')), "test16b: Looping after buffer-full close");
+
+            /* Set post-close (randomize_flavor already ran) and measure the
+             * very FIRST block — read_head has barely moved, nowhere near a
+             * wrap, so memory is still exactly 1.0 and degrade is exactly
+             * 0.0, regardless of the Warmth knob sitting at its maximum. */
+            api->set_param(inst, "loopA_wow", "0");
+            api->set_param(inst, "loopA_hf_loss", "0");
+            api->set_param(inst, "loopA_hiss", "0");
+            api->set_param(inst, "loopA_chaos", "0");
+            api->set_param(inst, "loopA_saturation", "1");
+            api->set_param(inst, "loopA_volume", "1");
+
+            int16_t buf[BLOCK_FRAMES * 2];
+            fill_silence(buf, BLOCK_FRAMES);
+            api->process_block(inst, buf, BLOCK_FRAMES);
+
+            float expected_wet = SAMPLE_F * 1.0f; /* memory == 1.0, degrade == 0.0 */
+            int32_t expected_out = lroundf(expected_wet * 32767.0f);
+            int mismatch = 0;
+            for (int i = 0; i < BLOCK_FRAMES; i++) {
+                if (abs((int)buf[i * 2] - (int)expected_out) > 1) mismatch = 1;
+                if (abs((int)buf[i * 2 + 1] - (int)expected_out) > 1) mismatch = 1;
+            }
+            check(!mismatch,
+                  "test16b: at degrade==0 (freshly closed) output is bit-exact identity "
+                  "even with saturation at its maximum (within 1 LSB)");
+
+            api->destroy_instance(inst);
+        }
+    }
+
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
@@ -503,6 +643,6 @@ int main(void) {
     printf("PASS: forgetful LoopEngine bench test "
            "(chain_params shape, record trigger, decay timing, "
            "erase double-click/stale-rearm, routing, status-line word "
-           "buckets, Loops Overview format)\n");
+           "buckets, Loops Overview format, saturation passthrough)\n");
     return 0;
 }
