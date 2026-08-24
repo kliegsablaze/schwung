@@ -36,13 +36,32 @@
  * required" note):
  *
  *   Page 0 (Master):  input_routing, loopA_volume..loopD_volume,
- *                      master_reserved_1..3
+ *                      master_loops_overview, master_reserved_1..2
  *   Page 1-4 (Loop A/B/C/D): loopX_decay_rate, loopX_wow, loopX_hf_loss,
  *                      loopX_hiss, loopX_saturation, loopX_chaos,
  *                      loopX_reserved, loopX_erase
  *
  * settings-schema.json isn't wired yet; constants below hardcode the
  * design doc's stated defaults, same as step 2.
+ *
+ * Build step 4 (docs/plans/forgetful-design.md, Build/Test Plan #4): the
+ * status-text half. `loopX_status` (previously a bare state-name stub) now
+ * builds the full state line the design doc specifies — "Looping - NN%
+ * (word)" while looping, via memory_word()'s bucket mapping, "Listening..."
+ * / "Recording" / "Forgotten" otherwise. ASCII punctuation throughout
+ * (hyphen, three periods), not an em-dash or the Unicode ellipsis, matching
+ * the Erase trigger's idle-spelling call ("-", not "—").
+ *
+ * The Master page's "status overview" turned out not to be expressible as
+ * text paired with each volume knob's cell: a chain_params entry only ever
+ * annotates its OWN knob, never a neighbor's, and the knob-grid's value
+ * cell (~30px at the 4x5 font — CELL_W/LABEL_CHARS in render_page_movy.mjs)
+ * has room for roughly 6-8 characters, nowhere near a 23-character
+ * "A:74% B:Rec C:-- D:12%" string. `master_loops_overview` (knob 6,
+ * access "read") is the fit-the-budget replacement: one glyph per loop in
+ * A/B/C/D order, no separators — '-' idle/forgotten, 'R' recording, else a
+ * memory decile digit (e.g. "7R-1"). This drops master_reserved_3 to make
+ * room; only master_reserved_1..2 remain on the Master page.
  */
 
 #include <stdio.h>
@@ -516,29 +535,77 @@ static int json_get_float(const char *json, const char *key, float *out) {
     return 0;
 }
 
-/* Display-only state name — distinct from `state` itself: FORGOTTEN reads
- * back here for FORGOTTEN_DISPLAY_MS after the engine has already reset to
- * IDLE, since the engine's own instant reset (LOOP_FORGOTTEN above) would
+/* Memory-percentage-to-word mapping (design doc "Screen / Feedback"). Takes
+ * the already-rounded display percentage (0..100), not raw float memory —
+ * `1.0f / decay_rate` isn't exactly representable, so repeated subtraction
+ * lands memory a hair under a clean boundary (0.899999976f instead of
+ * 0.90f). Bucketing on that raw float while printing a separately-rounded
+ * "%.0f%%" let the two disagree: "90% (Fading)", contradicting the doc's own
+ * "90-100% = Vivid" range. Deriving both the printed number and the word
+ * from one rounded int keeps them self-consistent by construction. Only
+ * meaningful while LOOPING: memory is always in (0, 1] there — the instant
+ * it reaches 0, process_block flips state to LOOP_FORGOTTEN in the same
+ * block, so the 0%/idle case is handled by state, not by this bucket. */
+static const char *memory_word(int pct) {
+    if (pct >= 90) return "Vivid";
+    if (pct >= 40) return "Fading";
+    if (pct >= 10) return "Hazy";
+    return "Almost gone";
+}
+
+/* The on-screen state line for a loop's own page (design doc "Screen /
+ * Feedback"): "Listening...", "Recording", "Looping - NN% (word)", or
+ * "Forgotten". Distinct from `state` itself: FORGOTTEN reads back here for
+ * FORGOTTEN_DISPLAY_MS after the engine has already reset to IDLE, since the
+ * engine's own instant reset (LOOP_FORGOTTEN in process_block) would
  * otherwise make FORGOTTEN unobservable to any UI poll landing between
- * process_block calls. Not a chain_params knob — this is groundwork for
- * the per-loop state line (Build/Test Plan step 4), reachable for now only
- * via get_param("loopX_status"). */
-/* total_frames lives on inst_t, not loop_engine_t, but the comparison only
+ * process_block calls. Reachable via get_param("loopX_status").
+ * total_frames lives on inst_t, not loop_engine_t, but the comparison only
  * needs the DELTA since forgotten_at (itself stamped from that same shared
  * counter) — so the caller passes the current total_frames in rather than
  * this function reaching for it. */
-static const char *loop_display_state_name(const loop_engine_t *loop, uint64_t total_frames) {
+static int loop_status_text(const loop_engine_t *loop, uint64_t total_frames, char *buf, int len) {
     if (loop->forgotten_at != TIME_NOT_SET &&
         total_frames - loop->forgotten_at < FORGOTTEN_DISPLAY_FRAMES) {
-        return "Forgotten";
+        return snprintf(buf, len, "Forgotten");
     }
     switch (loop->state) {
-        case LOOP_IDLE:      return "Idle";
-        case LOOP_RECORDING: return "Recording";
-        case LOOP_LOOPING:   return "Looping";
-        case LOOP_FORGOTTEN: return "Forgotten";
+        case LOOP_IDLE:      return snprintf(buf, len, "Listening...");
+        case LOOP_RECORDING: return snprintf(buf, len, "Recording");
+        case LOOP_LOOPING: {
+            int pct = (int)lroundf(loop->memory * 100.0f);
+            return snprintf(buf, len, "Looping - %d%% (%s)", pct, memory_word(pct));
+        }
+        case LOOP_FORGOTTEN: return snprintf(buf, len, "Forgotten");
     }
-    return "Idle";
+    return snprintf(buf, len, "Listening...");
+}
+
+/* Master page's "Loops Overview" readout (knob 6, access "read"): one
+ * character per loop in A/B/C/D order, no separators — the knob-grid value
+ * cell has room for roughly 6-8 characters (see the file header comment),
+ * not the ~23 a `letter:percentage` form per loop would need. '-' for
+ * idle/forgotten, 'R' for recording, otherwise a single digit giving memory
+ * rounded DOWN to the nearest 10% (e.g. 74% -> '7'). */
+static int master_loops_overview_text(const inst_t *s, char *buf, int len) {
+    char out[NUM_LOOPS + 1];
+    for (int i = 0; i < NUM_LOOPS; i++) {
+        const loop_engine_t *loop = &s->loops[i];
+        int forgotten_display = (loop->forgotten_at != TIME_NOT_SET &&
+            s->total_frames - loop->forgotten_at < FORGOTTEN_DISPLAY_FRAMES);
+        if (forgotten_display || loop->state == LOOP_IDLE || loop->state == LOOP_FORGOTTEN) {
+            out[i] = '-';
+        } else if (loop->state == LOOP_RECORDING) {
+            out[i] = 'R';
+        } else {
+            int decile = (int)(loop->memory * 10.0f);
+            if (decile > 9) decile = 9;
+            if (decile < 0) decile = 0;
+            out[i] = (char)('0' + decile);
+        }
+    }
+    out[NUM_LOOPS] = '\0';
+    return snprintf(buf, len, "%s", out);
 }
 
 /* Returns the loop index (0..3) and the suffix after "loopX_" if `key`
@@ -605,7 +672,7 @@ static int loop_get_param(const loop_engine_t *loop, uint64_t total_frames, cons
         return snprintf(buf, len, loop->erase_armed_since != TIME_NOT_SET ? "Tap again" : "-");
     }
     if (strcmp(suffix, "status") == 0) {
-        return snprintf(buf, len, "%s", loop_display_state_name(loop, total_frames));
+        return loop_status_text(loop, total_frames, buf, len);
     }
     return -1;
 }
@@ -665,7 +732,8 @@ static void v2_set_param(void *inst, const char *key, const char *val) {
     if (strcmp(key, "loopB_volume") == 0) { s->loop_volume[1] = clampf((float)atof(val), 0.0f, 1.0f); return; }
     if (strcmp(key, "loopC_volume") == 0) { s->loop_volume[2] = clampf((float)atof(val), 0.0f, 1.0f); return; }
     if (strcmp(key, "loopD_volume") == 0) { s->loop_volume[3] = clampf((float)atof(val), 0.0f, 1.0f); return; }
-    /* master_reserved_1..3 — access "read" — deliberately unhandled */
+    /* master_loops_overview and master_reserved_1..2 — access "read" —
+     * deliberately unhandled */
 
     int li;
     const char *suffix = loop_key_suffix(key, &li);
@@ -684,9 +752,9 @@ static int v2_get_param(void *inst, const char *key, char *buf, int len) {
     if (strcmp(key, "loopB_volume") == 0)  return snprintf(buf, len, "%.3f", s->loop_volume[1]);
     if (strcmp(key, "loopC_volume") == 0)  return snprintf(buf, len, "%.3f", s->loop_volume[2]);
     if (strcmp(key, "loopD_volume") == 0)  return snprintf(buf, len, "%.3f", s->loop_volume[3]);
+    if (strcmp(key, "master_loops_overview") == 0) return master_loops_overview_text(s, buf, len);
     if (strcmp(key, "master_reserved_1") == 0 ||
-        strcmp(key, "master_reserved_2") == 0 ||
-        strcmp(key, "master_reserved_3") == 0) return snprintf(buf, len, "-");
+        strcmp(key, "master_reserved_2") == 0) return snprintf(buf, len, "-");
 
     int li;
     const char *suffix = loop_key_suffix(key, &li);
@@ -727,7 +795,10 @@ static int v2_get_param(void *inst, const char *key, char *buf, int len) {
                   "\"display_format\":\"%%.0f\"}",
                 LOOP_LETTERS[i], LOOP_LETTERS[i], (double)DEFAULT_LOOP_VOLUME);
         }
-        for (int i = 0; i < 3; i++) {
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            ",{\"key\":\"master_loops_overview\",\"name\":\"Loops\",\"type\":\"string\","
+              "\"access\":\"read\"}");
+        for (int i = 0; i < 2; i++) {
             pos += snprintf(json + pos, sizeof(json) - pos,
                 ",{\"key\":\"master_reserved_%d\",\"name\":\"-\",\"type\":\"enum\","
                   "\"options\":[\"-\"],\"access\":\"read\"}", i + 1);
@@ -764,7 +835,7 @@ static int v2_get_param(void *inst, const char *key, char *buf, int len) {
         int pos = snprintf(json, sizeof(json),
             "{\"modes\":null,\"levels\":{\"root\":{\"label\":\"Forgetful\",\"knobs\":["
             "\"input_routing\",\"loopA_volume\",\"loopB_volume\",\"loopC_volume\",\"loopD_volume\","
-            "\"master_reserved_1\",\"master_reserved_2\",\"master_reserved_3\"");
+            "\"master_loops_overview\",\"master_reserved_1\",\"master_reserved_2\"");
         for (int i = 0; i < NUM_LOOPS; i++) {
             char c = LOOP_LETTERS[i];
             pos += snprintf(json + pos, sizeof(json) - pos,

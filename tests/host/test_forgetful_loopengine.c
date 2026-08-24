@@ -24,6 +24,12 @@
  *   5. routing — the one genuinely new behavior in this build step: closes
  *      A via a routing change (not silence-timeout or buffer-full), and A's
  *      decay keeps progressing on its own after B becomes the active target.
+ *   6. memory-word buckets (Build/Test Plan step 4) — every "NN% (word)"
+ *      reading loopA_status produces while Looping matches the design doc's
+ *      Vivid/Fading/Hazy/Almost gone boundaries, and all four are observed.
+ *   7. master_loops_overview format (step 4) — the Master page's knob-6
+ *      readout: all-idle, one loop Recording, and a fresh-close memory
+ *      decile alongside a second loop Recording, each checked byte-exact.
  *
  * Recordings closed deliberately via the buffer-full path (feed a full
  * buffer_seconds of continuous tone) rather than the silence-timeout path —
@@ -97,6 +103,15 @@ static const char *status_of(audio_fx_api_v2_t *api, void *inst, char letter) {
     if (n <= 0) buf[0] = '\0';
     return buf;
 }
+
+/* loopX_status is now a full state line (Build/Test Plan step 4), not a bare
+ * state name — "Idle" became "Listening..." and "Looping" became
+ * "Looping - NN% (word)" with a live percentage, so the LOOPING checks below
+ * match the fixed prefix rather than the whole string. */
+static int status_is_looping(const char *status) {
+    return strncmp(status, "Looping - ", 10) == 0;
+}
+#define STATUS_LISTENING "Listening..."
 
 static const char *erase_readout(audio_fx_api_v2_t *api, void *inst, char letter) {
     static char key[32];
@@ -178,7 +193,7 @@ int main(void) {
         /* every expected key, in both blobs */
         static const char *master_keys[] = {
             "input_routing", "loopA_volume", "loopB_volume", "loopC_volume", "loopD_volume",
-            "master_reserved_1", "master_reserved_2", "master_reserved_3"
+            "master_loops_overview", "master_reserved_1", "master_reserved_2"
         };
         for (size_t i = 0; i < sizeof(master_keys) / sizeof(master_keys[0]); i++) {
             snprintf(probe, sizeof(probe), "\"key\":\"%s\"", master_keys[i]);
@@ -219,7 +234,7 @@ int main(void) {
             api->process_block(inst, buf, BLOCK_FRAMES);
             check(memcmp(buf, ref, sizeof(buf)) == 0, "test1: dry passthrough below threshold");
         }
-        check(strcmp(status_of(api, inst, 'A'), "Idle") == 0, "test1: stays Idle below threshold");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test1: stays Idle below threshold");
 
         /* Above threshold, but short of the debounce window: still Idle,
          * dry still passes through (this is the state the original plan's
@@ -260,7 +275,7 @@ int main(void) {
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0, "test2: Looping after buffer-full close");
+        check(status_is_looping(status_of(api, inst, 'A')), "test2: Looping after buffer-full close");
 
         /* ~3 wraps of a TEST_BUFFER_CAPACITY_FRAMES-length loop, with slack
          * for wow/flutter's small speed modulation. */
@@ -278,7 +293,7 @@ int main(void) {
 
         /* Run past the display window: status settles to Idle. */
         run_silence(api, inst, TEST_FORGOTTEN_DISPLAY_FRAMES + BLOCK_FRAMES * 4);
-        check(strcmp(status_of(api, inst, 'A'), "Idle") == 0, "test2: status settles to Idle after the display window");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test2: status settles to Idle after the display window");
 
         /* Engine is genuinely reset — a fresh tone can start recording again
          * immediately (still routed to A from record_full_buffer_loop_a). */
@@ -296,16 +311,16 @@ int main(void) {
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0, "test3: Looping before erase");
+        check(status_is_looping(status_of(api, inst, 'A')), "test3: Looping before erase");
 
         api->set_param(inst, "loopA_erase", "Erase!");
         check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0, "test3: single click arms");
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0, "test3: single click does not clear");
+        check(status_is_looping(status_of(api, inst, 'A')), "test3: single click does not clear");
 
         run_silence(api, inst, BLOCK_FRAMES * 4); /* well under the confirm window */
         api->set_param(inst, "loopA_erase", "Erase!");
         check(strcmp(erase_readout(api, inst, 'A'), "-") == 0, "test3: confirmed erase clears the arm");
-        check(strcmp(status_of(api, inst, 'A'), "Idle") == 0, "test3: confirmed erase drops to Idle");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test3: confirmed erase drops to Idle");
 
         api->destroy_instance(inst);
     }
@@ -317,7 +332,7 @@ int main(void) {
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0, "test4: Looping before erase");
+        check(status_is_looping(status_of(api, inst, 'A')), "test4: Looping before erase");
 
         api->set_param(inst, "loopA_erase", "Erase!");
         check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0, "test4: first click arms");
@@ -327,12 +342,12 @@ int main(void) {
         api->set_param(inst, "loopA_erase", "Erase!");
         check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0,
               "test4: stale click re-arms rather than confirming");
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0, "test4: stale click must not clear the loop");
+        check(status_is_looping(status_of(api, inst, 'A')), "test4: stale click must not clear the loop");
 
         run_silence(api, inst, BLOCK_FRAMES * 4); /* well under the fresh window */
         api->set_param(inst, "loopA_erase", "Erase!");
         check(strcmp(erase_readout(api, inst, 'A'), "-") == 0, "test4: fresh arm confirms normally");
-        check(strcmp(status_of(api, inst, 'A'), "Idle") == 0, "test4: fresh-arm confirm drops to Idle");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test4: fresh-arm confirm drops to Idle");
 
         api->destroy_instance(inst);
     }
@@ -360,7 +375,7 @@ int main(void) {
         /* Switch routing away from A mid-recording. This must close A
          * SYNCHRONOUSLY, inside this very set_param call. */
         api->set_param(inst, "input_routing", TEST_ROUTE_B);
-        check(strcmp(status_of(api, inst, 'A'), "Looping") == 0,
+        check(status_is_looping(status_of(api, inst, 'A')),
               "test5: A closes into Looping the instant routing moves away "
               "(proves the close came from the routing change, not silence-timeout)");
 
@@ -389,12 +404,105 @@ int main(void) {
         api->destroy_instance(inst);
     }
 
+    /* ---- Test 6: memory-word bucket mapping in the loop-page status line
+     * (Loop A) - Build/Test Plan step 4 ---- */
+    {
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test6: create_instance");
+
+        api->set_param(inst, "loopA_decay_rate", "20"); /* 5%-per-wrap steps */
+
+        float phase = 0.0f;
+        record_full_buffer_loop_a(api, inst, &phase);
+        check(status_is_looping(status_of(api, inst, 'A')), "test6: Looping after buffer-full close");
+
+        /* Poll every block through ~20 wraps plus slack for wow/flutter's
+         * small speed modulation, and check every observed "NN% (word)"
+         * reading against the design doc's bucket boundaries directly -
+         * this doesn't depend on landing on any particular wrap, so it's
+         * robust to the read-speed jitter that makes exact wrap counting
+         * impractical (see test2's comment on the same issue). */
+        long budget = TEST_BUFFER_CAPACITY_FRAMES * 20 + 500000;
+        long advanced = 0;
+        int saw_vivid = 0, saw_fading = 0, saw_hazy = 0, saw_almost_gone = 0;
+        int bucket_mismatch = 0;
+        int16_t buf[BLOCK_FRAMES * 2];
+        while (advanced < budget && strcmp(status_of(api, inst, 'A'), "Forgotten") != 0) {
+            fill_silence(buf, BLOCK_FRAMES);
+            api->process_block(inst, buf, BLOCK_FRAMES);
+            const char *s = status_of(api, inst, 'A');
+            int pct;
+            char word[32];
+            if (sscanf(s, "Looping - %d%% (%31[^)])", &pct, word) == 2) {
+                const char *expected =
+                    pct >= 90 ? "Vivid" :
+                    pct >= 40 ? "Fading" :
+                    pct >= 10 ? "Hazy" : "Almost gone";
+                if (strcmp(word, expected) != 0) bucket_mismatch = 1;
+                if (strcmp(word, "Vivid") == 0)       saw_vivid = 1;
+                if (strcmp(word, "Fading") == 0)      saw_fading = 1;
+                if (strcmp(word, "Hazy") == 0)        saw_hazy = 1;
+                if (strcmp(word, "Almost gone") == 0) saw_almost_gone = 1;
+            }
+            advanced += BLOCK_FRAMES;
+        }
+        check(!bucket_mismatch, "test6: every observed percentage matches the design doc's word bucket");
+        check(saw_vivid,       "test6: observed the Vivid bucket (90-100%)");
+        check(saw_fading,      "test6: observed the Fading bucket (40-89%)");
+        check(saw_hazy,        "test6: observed the Hazy bucket (10-39%)");
+        check(saw_almost_gone, "test6: observed the Almost gone bucket (1-9%)");
+
+        api->destroy_instance(inst);
+    }
+
+    /* ---- Test 7: master_loops_overview format (Master page knob 6) -
+     * Build/Test Plan step 4 ---- */
+    {
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test7: create_instance");
+
+        char buf[16];
+        int n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
+        check(n == 4, "test7: overview is exactly 4 characters");
+        check(strcmp(buf, "----") == 0, "test7: fresh instance reads all-idle");
+
+        /* Route to A, well past debounce, and (unlike test1/test5's shorter
+         * "just confirm Recording" probes) far enough past it that write_head
+         * clears the too-short-a-take discard floor too - this take gets
+         * CLOSED below via a routing change, and a discarded take would read
+         * back Idle instead of Looping. */
+        api->set_param(inst, "input_routing", TEST_ROUTE_A);
+        float phase = 0.0f;
+        long a_take_frames = TEST_DEBOUNCE_FRAMES + 20000;
+        run_tone(api, inst, a_take_frames, 0.5f, 440.0f, &phase);
+        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test7: A is Recording");
+        n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
+        check(n == 4 && strcmp(buf, "R---") == 0, "test7: overview shows A recording, rest idle");
+
+        /* Switch routing to B: closes A into Looping at memory=1.0 - the top
+         * decile, digit '9' (the decile scheme has no distinct digit for
+         * "100%" versus "90-99%", by design - see the header comment). */
+        api->set_param(inst, "input_routing", TEST_ROUTE_B);
+        n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
+        check(n == 4 && strcmp(buf, "9---") == 0, "test7: overview shows A's fresh-close decile, rest idle");
+
+        /* B now records too: overview reflects both loops at once. */
+        float phase_b = 0.0f;
+        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6, 0.5f, 880.0f, &phase_b);
+        check(strcmp(status_of(api, inst, 'B'), "Recording") == 0, "test7: B is Recording");
+        n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
+        check(n == 4 && strcmp(buf, "9R--") == 0, "test7: overview reflects both A and B simultaneously");
+
+        api->destroy_instance(inst);
+    }
+
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
     }
     printf("PASS: forgetful LoopEngine bench test "
            "(chain_params shape, record trigger, decay timing, "
-           "erase double-click/stale-rearm, routing)\n");
+           "erase double-click/stale-rearm, routing, status-line word "
+           "buckets, Loops Overview format)\n");
     return 0;
 }

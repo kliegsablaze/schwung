@@ -1,12 +1,12 @@
-# Forgetful — Design Document (v7 — locked for v1 implementation)
+# Forgetful - Design Document (v7 - locked for v1 implementation)
 
 **Module ID:** `forgetful`
-**Component type:** `audio_fx` (chainable — lives in a Signal Chain fx1/fx2 slot,
+**Component type:** `audio_fx` (chainable - lives in a Signal Chain fx1/fx2 slot,
 uses only the standard knob-turn + jog-page-scroll interaction, no raw MIDI /
 custom touch gestures needed)
 **One-line pitch:** One live input, routed by hand into whichever of four
 tape memories you choose, each one already forgetting itself the moment you
-move on — drifting out of tune, losing its top end, getting quieter, until
+move on - drifting out of tune, losing its top end, getting quieter, until
 it's gone. Mix the four together and you're performing with your own recent
 past, a little more blurred each time you glance back at it.
 
@@ -14,7 +14,7 @@ past, a little more blurred each time you glance back at it.
 
 v5 had four loops each passively, independently listening to their own input
 feed, one full page each (8 knobs: volume, degrade rate, 5 flavor knobs,
-erase). **v6 adds a fifth page — a Master/Mixer page — and reworks the whole
+erase). **v6 adds a fifth page - a Master/Mixer page - and reworks the whole
 module around a single shared live input that you explicitly route to one
 buffer at a time.** This turns Forgetful into something you actively perform
 with (build up A, move to B while A decays under it, bring in C, mix the
@@ -27,37 +27,43 @@ knob on each loop page.
 ## Concept
 
 One live input. Four small tape memories. You decide, moment to moment,
-which one is currently listening — turn the routing knob to point the input
+which one is currently listening - turn the routing knob to point the input
 at A, play, turn it to B, keep playing while A quietly starts forgetting
 itself underneath, bring in C, glance back and mix in what's left of A. Nothing
 you route into stays sharp for long: every loop starts degrading the instant
-you move on from it — pitch wobbling, highs dulling, getting quieter — until
+you move on from it - pitch wobbling, highs dulling, getting quieter - until
 it's silent and ready to be filled again.
 
 ## Interaction Model
 
 **Five pages, navigated via jog wheel scroll:** Master, then Loop A, B, C, D.
 
-### Page 0 — Master / Mixer
+### Page 0 - Master / Mixer
 
 | Knob | Control | Behavior |
 | --- | --- | --- |
-| 1 | **Input Routing** | Standard `enum` param, options `None`/`A`/`B`/`C`/`D`. Determines which buffer the live input currently feeds. Default `None` — nothing records until you deliberately point it somewhere. Every enum with declared `options` is automatically divable (touch + jog-click opens a scrolling picker) — no custom code needed for that; turning also steps it one option at a time. |
-| 2 | Volume — Loop A | Standard continuous param |
-| 3 | Volume — Loop B | Standard continuous param |
-| 4 | Volume — Loop C | Standard continuous param |
-| 5 | Volume — Loop D | Standard continuous param |
-| 6–8 | *Reserved (placeholder)* | Declared as inert `chain_params` entries — **structurally required**, not just idle. Flat `chain_params` arrays auto-paginate 8-per-page in declaration order; without real entries here, Loop A's params would spill onto knobs 6–8 of *this* page instead of starting fresh on page 2. Candidates for real future use: master wet/dry, global freeze-all, master saturation. |
+| 1 | **Input Routing** | Standard `enum` param, options `None`/`A`/`B`/`C`/`D`. Determines which buffer the live input currently feeds. Default `None` - nothing records until you deliberately point it somewhere. Every enum with declared `options` is automatically divable (touch + jog-click opens a scrolling picker) - no custom code needed for that; turning also steps it one option at a time. |
+| 2 | Volume - Loop A | Standard continuous param |
+| 3 | Volume - Loop B | Standard continuous param |
+| 4 | Volume - Loop C | Standard continuous param |
+| 5 | Volume - Loop D | Standard continuous param |
+| 6 | **Loops Overview** | Read-only (`access: "read"`) compact status readout covering all four loops at once, one character per loop in A/B/C/D order: `-` idle/forgotten, `R` recording, or a single digit (memory rounded down to the nearest 10%) while looping - e.g. `7R-1` means A is 70-79% remembered, B is recording, C is idle, D is 10-19% remembered. |
+| 7–8 | *Reserved (placeholder)* | Declared as inert `chain_params` entries - **structurally required**, not just idle. Flat `chain_params` arrays auto-paginate 8-per-page in declaration order; without real entries here, Loop A's params would spill onto knobs 7–8 of *this* page instead of starting fresh on page 2. Candidates for real future use: master wet/dry, global freeze-all. |
 
-This page doubles as the **status overview**: alongside each volume knob's
-label, the screen shows that loop's current state (e.g. `B: Looping 74%
-(Fading)`), so you can see all four at a glance without leaving the Master
-page. This replaces the earlier "always-visible strip on every page" idea
-from v5 — turns out the Master page is a more natural home for it, and
-resolves that open question without needing custom layout work on the other
-four pages.
+This page doubles as the **status overview** via knob 6's Loops Overview
+readout, so you can see all four loops at a glance without leaving the
+Master page. This replaces the earlier "always-visible strip on every page"
+idea from v5, and also replaces this doc's own earlier plan of pairing status
+text alongside each volume knob's label (e.g. a `B: Looping 74% (Fading)`
+reading next to knob 3) - confirmed against `docs/MODULES.md` that a
+`chain_params` entry can only annotate its own knob cell, not a neighbor's,
+and that the knob-grid's value cell (~30px at the 4x5 font, per
+`render_page_movy.mjs`'s `CELL_W`/`LABEL_CHARS`) has room for roughly 6-8
+characters - nowhere near enough for four `letter:percentage` pairs. A single
+compact code covering all four loops fits that budget; a per-knob pairing
+does not.
 
-### Page 1–4 — Loop A / B / C / D
+### Page 1–4 - Loop A / B / C / D
 
 Volume is gone from these pages (moved to Master). Degrade Rate shifts into
 knob 1 so the layout stays predictable:
@@ -70,8 +76,8 @@ knob 1 so the layout stays predictable:
 | 4 | Hiss | Standard continuous param, 0–1 |
 | 5 | Warmth (saturation) | Standard continuous param, 0–1 |
 | 6 | Sudden Forgetting (chaos) | Standard continuous param, 0–1 |
-| 7 | *Reserved (placeholder)* | Same page-alignment requirement as Master's 6–8 — see note there. Candidate for later: a "character" preset knob, pitch offset. |
-| 8 | **Erase** | Real `chain_params` trigger — see below (changed from v6's "turn-to-unspool") |
+| 7 | *Reserved (placeholder)* | Same page-alignment requirement as Master's 6–8 - see note there. Candidate for later: a "character" preset knob, pitch offset. |
+| 8 | **Erase** | Real `chain_params` trigger - see below (changed from v6's "turn-to-unspool") |
 
 ### Recording: routed, not per-loop-independent (changed in v6)
 
@@ -82,7 +88,7 @@ the Master page's Input Routing knob can receive it:
   level. If it's `IDLE` and input crosses `record_threshold` (settings-schema
   field, default ~-30dBFS) for longer than a short debounce (~50ms), it
   enters `RECORDING`.
-- The other three buffers receive no input at all while not selected — they
+- The other three buffers receive no input at all while not selected - they
   simply hold whatever state they're already in (continuing to `LOOP`/decay
   normally if that's what they were doing; sitting `IDLE` if empty).
 - Input Routing = `None`: no buffer receives input; all four just continue
@@ -93,13 +99,13 @@ whichever of these happens first:**
 1. `silence_timeout` (settings-schema field, default ~1.5s) of near-silent
    input, or
 2. `buffer_seconds` max length reached, or
-3. **(new in v6)** Input Routing is turned away from this buffer — either to
+3. **(new in v6)** Input Routing is turned away from this buffer - either to
    a different letter or to `None`. Moving on is treated as "I'm done with
    this one," an explicit close in addition to the passive silence-based one.
    This also covers sustained ambient sources (drones, pads) that might never
    go properly silent on their own.
 
-### Erase: real trigger, double-click-confirm (knob 8) — changed in v7
+### Erase: real trigger, double-click-confirm (knob 8) - changed in v7
 
 `docs/MODULES.md` documents an `access` field on `chain_params` entries,
 independent of `type`:
@@ -115,15 +121,15 @@ synthetic turn-based mechanics. Knob 8 is declared:
 
 ```
 {"key": "loopX_erase", "name": "Erase", "type": "enum",
- "options": ["—", "Erase!"], "access": "write"}
+ "options": ["-", "Erase!"], "access": "write"}
 ```
 
-Touching knob 8 and clicking the jog wheel **fires** the trigger — the module
+Touching knob 8 and clicking the jog wheel **fires** the trigger - the module
 receives a `set_param("loopX_erase", ...)` call each time, regardless of
 which option string is nominally associated. Because `access: "write"`
 disables turning/scrubbing entirely, the value can never drift there by
 accident (this is the exact hazard the docs warn about elsewhere: a
-turnable trigger-shaped enum can fire from an ordinary knob nudge — declaring
+turnable trigger-shaped enum can fire from an ordinary knob nudge - declaring
 `write` closes that off at the host level, not just in our own code).
 
 **Double-click-confirm, implemented in module state (not host-provided):**
@@ -137,9 +143,9 @@ firing a trigger is instantaneous, so the confirm behavior you asked for
   `IDLE`.
 - No second fire within the window: the armed state simply lapses (nothing
   cleared, no visible LED to reset since we're not managing knob LEDs
-  directly — the screen hint just reverts on next redraw).
+  directly - the screen hint just reverts on next redraw).
 
-Works identically regardless of Input Routing state — you can erase a loop
+Works identically regardless of Input Routing state - you can erase a loop
 that isn't currently selected for recording.
 
 ## State Machine (per loop, ×4 independent instances)
@@ -152,15 +158,15 @@ LOOPING ──(memory reaches 0)──> FORGOTTEN ──(auto)──> IDLE
 (any non-empty state) ──(knob 8 fired twice within ~600ms)──> IDLE (hard clear)
 ```
 
-Note: `LOOPING`'s decay progresses regardless of routing — a loop keeps
+Note: `LOOPING`'s decay progresses regardless of routing - a loop keeps
 forgetting itself whether or not it's currently the recording target.
 
 ## Screen / Feedback
 
 Same as v5: no raw MIDI/custom LED control in chain-embedded mode, so state
 communication is entirely on-screen. Master page carries the 4-loop overview
-(see above); each loop's own page shows its state line (`Listening…` /
-`Recording` / `Looping — 74% (Fading)` / `Forgotten`) plus its 7 knob
+(see above); each loop's own page shows its state line (`Listening...` /
+`Recording` / `Looping - 74% (Fading)` / `Forgotten`) plus its 7 knob
 labels/values, with knob 8 showing `Unspool: NN%`.
 
 Memory-percentage-to-word mapping unchanged: 90–100% "Vivid", 40–89%
@@ -189,14 +195,14 @@ plus one shared input router.
 Unchanged from v5: `memory` decrements per loop-wrap by `1/decay_repeats`;
 wow/flutter, HF loss, hiss, saturation, chaos all driven by `(1-memory)`;
 flavor params re-randomize on `RECORDING → LOOPING` unless locked to a fixed
-value via `settings-schema.json` — except Degrade Rate, which is a live knob
+value via `settings-schema.json` - except Degrade Rate, which is a live knob
 (now knob 1 on each loop page). **Volume is now a Master-page live knob, not
-a per-loop settings/randomization concern at all** — it directly scales that
+a per-loop settings/randomization concern at all** - it directly scales that
 loop's contribution to the summed output, independent of the degrade model.
 
 **Decided (carried over from v5):** flavor knobs (2–6 on each loop page) are
 live and override the current randomized value immediately, staying put
-until that loop is erased and takes a new recording — randomization only
+until that loop is erased and takes a new recording - randomization only
 fires once, at `RECORDING → LOOPING`.
 
 ### Erase state (changed in v7)
@@ -205,7 +211,7 @@ Per-loop `erase_armed_at` timestamp (or sentinel "not armed"). On each
 screen hint); if armed and within `~600ms` of the recorded time, hard-clear
 the loop and reset `erase_armed_at` to "not armed"; if armed but the window
 has elapsed, treat this fire as a fresh first press (re-arm) rather than a
-second press — an old, stale arm should not be redeemable by a much later
+second press - an old, stale arm should not be redeemable by a much later
 click.
 
 ### Signal flow per block
@@ -227,13 +233,13 @@ output, so any state that produced silence as *the* output would mute the
 whole track whenever no loop happened to be `LOOPING`. The corrected rule:
 dry input passes straight through unconditionally in every state (`IDLE`,
 `RECORDING`, `LOOPING`, `FORGOTTEN`); each state instead contributes an
-additive **wet** layer on top of that dry signal — `IDLE`, `RECORDING`, and
+additive **wet** layer on top of that dry signal - `IDLE`, `RECORDING`, and
 `FORGOTTEN` all contribute zero, only `LOOPING`'s degraded playback
 contributes non-zero wet. This resolves the ambiguity in the bullets above:
 `RECORDING` was never a special case, it's just one of three states that
 contribute no wet. When generalizing to four `LoopEngine`s (Build/Test Plan
 step 3), dry must be added to the output exactly once, with all four loops'
-wet contributions summed on top of it — not once per engine, which would
+wet contributions summed on top of it - not once per engine, which would
 quadruple the dry signal.
 
 ### Capability flags
@@ -277,7 +283,7 @@ Unchanged from v5:
     "component_type": "audio_fx",
     "requires_continuous_processing": true,
     "chain_params": [
-      "Page 0 (Master): input_routing (enum), loopA_volume, loopB_volume, loopC_volume, loopD_volume, [reserved placeholder x3]",
+      "Page 0 (Master): input_routing (enum), loopA_volume, loopB_volume, loopC_volume, loopD_volume, master_loops_overview (string, access: read), [reserved placeholder x2]",
       "Page 1-4 (Loop A/B/C/D): loopX_decay_rate, loopX_wow, loopX_hf_loss, loopX_hiss, loopX_saturation, loopX_chaos, [reserved placeholder], loopX_erase (enum, access: write)"
     ]
   }
@@ -297,26 +303,30 @@ than assumption. Nothing below should block starting the DSP work.
 
 ## Open Questions / Risks (implementation-time, non-blocking)
 
-- **Reserved/placeholder knobs** (Master 6–8, each loop page's 7) — confirmed
+- **Reserved/placeholder knobs** (Master 7–8, each loop page's 7) - confirmed
   structurally necessary for page alignment (see table notes above), not just
   idle. Exact placeholder param shape (e.g. a harmless `read`-only dummy vs.
-  a genuinely inert `readwrite` float) to decide during implementation.
-- **`record_threshold` / `silence_timeout` tuning** — first-guess defaults,
+  a genuinely inert `readwrite` float) to decide during implementation. Master
+  knob 6 is no longer in this category - it's now the decided Loops Overview
+  readout (see Page 0 table above).
+- **`record_threshold` / `silence_timeout` tuning** - first-guess defaults,
   will need ear-tuning once DSP exists.
-- **LED behavior in generic chain mode** — the "Chain editor knob feedback is
+- **LED behavior in generic chain mode** - the "Chain editor knob feedback is
   a CARD" section of `CLAUDE.md` describes touch raising a value card, not
   per-module custom LED coloring; screen-based feedback (our plan) is the
-  correct approach here, not a fallback for something unavailable — this is
+  correct approach here, not a fallback for something unavailable - this is
   now confirmed, not just assumed.
-- **`erase_confirm_window_ms` default (600ms)** — still a first guess, easy
+- **`erase_confirm_window_ms` default (600ms)** - still a first guess, easy
   to retune.
-- Overdub layering — still out of scope for v1.
+- Overdub layering - still out of scope for v1.
 
 ## Build/Test Plan
 
-1. Check whether the Master page's status-overview text fits alongside 5
-   knob labels on the standard chain param-page layout; simplify status
-   text if space is tight.
+1. ~~Check whether the Master page's status-overview text fits alongside 5
+   knob labels~~ - resolved: it doesn't (see Page 0 table above). The
+   Loops Overview readout on knob 6 - one compact code per loop, not text
+   paired with each volume knob - is what actually fits the knob-grid's
+   value-cell budget.
 2. Implement DSP in C: start with **one** `LoopEngine` in isolation
    (envelope follower, buffer, degradation chain, double-click erase trigger
    handling), bench-test it end-to-end before replicating to four.
@@ -324,7 +334,8 @@ than assumption. Nothing below should block starting the DSP work.
    `audio_fx_api_v2_t` plugin instance, in-place `process_block`.
 4. Implement `chain_params` declarations (flat array, 5 pages × 8 including
    placeholders) and the `get_param` text needed for the Master page's
-   per-loop status overview and each loop page's state line / erase-armed hint.
+   `master_loops_overview` readout and each loop page's state line
+   (`loopX_status`) / erase-armed hint.
 5. Bench-test DSP standalone with synthetic input, verifying routed
    recording, all three close conditions (silence/max-length/routing-change),
    decay timing, and double-click erase (including the stale-arm-does-not-
