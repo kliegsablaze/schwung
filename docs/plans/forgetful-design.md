@@ -247,9 +247,37 @@ quadruple the dry signal.
   `requires_continuous_processing: true`.
 - Fully standard chain_params-driven module, no raw MIDI dependency.
 
-## Per-Module Settings (`settings-schema.json`)
+## Per-Module Settings (`settings-schema.json`) — DEFERRED for v1
 
-Unchanged from v5:
+**Not shipped in v1.** Researched before deciding (not skipped as an
+oversight): there is currently no mechanism for a chain-embedded `audio_fx`
+module to read `config.json` at runtime. The one existing runtime-read path
+(`ui.js` calling `host_read_file`, per `docs/MODULES.md` "Reading values at
+runtime") is unavailable here because the chain host loads audio FX directly
+as `<id>.so` and does not consult `module.json`'s `ui` field for FX slots — no
+JS side ever runs for this module in its normal chain-embedded context. The
+other candidate path — the DSP instance reading `config.json` itself in
+`create_instance` — doesn't work either: `create_instance` is a module entry
+point that runs on the SPI callback thread (`CLAUDE.md`, "Realtime Safety"),
+where file I/O is explicitly forbidden. Confirmed no precedent exists either:
+no chain-embedded `audio_fx` module in this repo (`freeverb`, `gesture-test`)
+has a `settings-schema.json`, and the design doc that introduced the whole
+per-module-config system (`docs/plans/2026-04-24-per-module-config.md`) only
+ever exercises it through modules with their own `ui.js` (tools) — chain DSP
+modules were never part of that design's scope.
+
+The real fix is a `chain_host.c` change — e.g. having the chain host read
+`config.json` itself at load time (off the realtime path, at `dlopen`/
+`create_instance`-call time rather than inside the callback) and pass it
+through as `json_defaults` — but that's a platform change with its own design
+questions, decoupled from this branch. Worth proposing separately later.
+
+For v1, the five flavor-param ranges below and `erase_confirm_window_ms` are
+**hardcoded constants** in `forgetful.c` (see the `settings-schema default`
+comments there); `buffer_seconds`, `record_threshold`, and `silence_timeout`
+are likewise hardcoded. Table kept below for reference — as the values a
+future `settings-schema.json` would expose — not as anything currently live
+or user-configurable.
 
 | Key | Label | Type | Notes |
 | --- | --- | --- | --- |
@@ -319,6 +347,13 @@ than assumption. Nothing below should block starting the DSP work.
 - **`erase_confirm_window_ms` default (600ms)** - still a first guess, easy
   to retune.
 - Overdub layering - still out of scope for v1.
+- **`settings-schema.json` deferred, not just unimplemented** - confirmed via
+  research (see "Per-Module Settings" above) that no chain-embedded `audio_fx`
+  module has a working path to read `config.json` today; wiring it requires a
+  `chain_host.c` change (reading `config.json` at load time and passing it
+  through `json_defaults`) that is out of scope for this branch. Decision:
+  ship v1 with the settings table's values hardcoded, revisit once/if the
+  `chain_host.c` side is built.
 
 ## Build/Test Plan
 
