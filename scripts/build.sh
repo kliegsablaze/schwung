@@ -163,6 +163,7 @@ mkdir -p ./build/lib/
 mkdir -p ./build/licenses/
 mkdir -p ./build/modules/chain/
 mkdir -p ./build/modules/audio_fx/freeverb/
+mkdir -p ./build/modules/audio_fx/forgetful/
 mkdir -p ./build/modules/midi_fx/chord/
 mkdir -p ./build/modules/midi_fx/arp/
 mkdir -p ./build/modules/midi_fx/velocity_scale/
@@ -522,6 +523,19 @@ if needs_rebuild build/modules/audio_fx/freeverb/freeverb.so \
         -lm
 else
     echo "Skipping freeverb (up to date)"
+fi
+
+# Build Forgetful audio FX (WIP: Loop A only — docs/plans/forgetful-design.md)
+if needs_rebuild build/modules/audio_fx/forgetful/forgetful.so \
+    src/modules/audio_fx/forgetful/dsp/forgetful.c src/host/audio_fx_api_v2.h; then
+    echo "Building forgetful..."
+    "${CROSS_PREFIX}gcc" -g -O3 -shared -fPIC \
+        src/modules/audio_fx/forgetful/dsp/forgetful.c \
+        -o build/modules/audio_fx/forgetful/forgetful.so \
+        -Isrc -Isrc/modules/audio_fx/forgetful/dsp \
+        -lm
+else
+    echo "Skipping forgetful (up to date)"
 fi
 
 # Build Gesture Test audio FX — a hardware TEST FIXTURE, not a shipped module.
