@@ -4,58 +4,77 @@
  * the module's public v2 API (create_instance/set_param/get_param/
  * process_block), exactly as chain_host would drive it. Black-box — this
  * does not reach into forgetful.c's internals, so the timing constants below
- * mirror the design doc's documented defaults rather than forgetful.c's
- * private macros.
+ * mirror forgetful.c's own documented defaults rather than its private
+ * macros.
+ *
+ * Rewritten 2026-08-25 for the manual-record redesign (on-device feedback):
+ * level-detection auto-trigger (record_threshold/debounce) and the
+ * silence-timeout close are GONE, replaced by the Master page's
+ * `master_record` trigger (press to start, press again to stop) — real
+ * playing levels didn't reliably cross any single fixed threshold, and the
+ * silence-timeout baked an audible pause into the start of every loop.
+ * `loopX_decay_rate`'s UNIT also changed, from "repeats until forgotten" to
+ * "seconds until forgotten" — decay is now continuous per-sample, not
+ * stepped once per buffer wrap, so total disintegration time no longer
+ * depends on how long the recording is.
  *
  * Covers:
- *   0. chain_params / ui_hierarchy shape — exactly 40 entries (5 pages x 8),
- *      every expected key present in both.
- *   1. record trigger — debounce timing, and dry input passing through
- *      unconditionally (IDLE and RECORDING both). Loop A only; the four
- *      loops' own per-loop behavior is identical, so this isn't repeated
- *      per letter.
- *   2. decay timing — memory reaching 0 after decay_rate wraps, and the
- *      forgotten_at display window (get_param("loopX_status") reporting
- *      "Forgotten" for a while after the engine has already reset to Idle).
- *   3. double-click / stale-rearm erase — a single click arms but doesn't
- *      clear; a second click within the window confirms; a second click
- *      after the window lapses re-arms instead of confirming.
- *   4. (folded into 3, see test4) stale arm re-arming, then confirming.
- *   5. routing — the one genuinely new behavior in this build step: closes
- *      A via a routing change (not silence-timeout or buffer-full), and A's
- *      decay keeps progressing on its own after B becomes the active target.
- *   6. memory-word buckets (Build/Test Plan step 4) — every "NN% (word)"
- *      reading loopA_status produces while Looping matches the design doc's
- *      Vivid/Fading/Hazy/Almost gone boundaries, and all four are observed.
- *   7. master_loops_overview format (step 4) — the Master page's knob-6
- *      readout: all-idle, one loop Recording, and a fresh-close memory
- *      decile alongside a second loop Recording, each checked byte-exact.
- *   8. silence-timeout close — the third close condition, unexercised by
- *      1-7 (which use buffer-full or routing-change).
- *   9. too-short blip discard — close_recording's MIN_RECORDED_FRAMES floor.
- *  10. routing -> None closes a recording, same as routing to another letter.
- *  11. parameter clamping/bounds on every knob, plus a rejected (not
- *      clamped) out-of-range input_routing value.
- *  12. extreme decay_rate = 60 (the slow boundary; 1-7 only cover 3 and 20).
- *  13. a silence gap mid-recording shorter than silence_timeout does not
- *      false-close, and the timeout resets rather than just pausing.
- *  14. erase fired while Idle (no-op safety) and while Recording (hard
- *      closes immediately, discarding the take) — 3/4 only cover Looping.
- *  15. `state` get/set round-trip: live knobs survive into a fresh instance
+ *   0. chain_params / ui_hierarchy shape — exactly 40 entries (8 master +
+ *      4x8 loop), every expected key present in both, including
+ *      master_record/master_freeze, and no OFF option in Route's options
+ *      list.
+ *   1. manual record start/stop — a fresh instance is already routed to A
+ *      (no OFF/unrouted state); dry passthrough is unconditional across
+ *      Idle/Recording/Looping; a press starts Recording immediately; a
+ *      second press closes into Looping; a press while Looping is also a
+ *      no-op (overdub/record-over is out of scope for v1); the
+ *      master_record readout itself reflects REC while recording and "-"
+ *      otherwise.
+ *   2. decay timing (now wall-clock SECONDS, not repeats) + the
+ *      forgotten_at display window.
+ *   3. continuous decay — memory measurably drops well within a single wrap
+ *      of a multi-second recording, proving decay no longer waits for a
+ *      buffer wrap to progress.
+ *   4. single-click erase on a LOOPING loop starts a fade-out (no confirm
+ *      click any more — see forgetful.c's erase handler comment), and it
+ *      completes and clears on schedule.
+ *   5. a fresh master_record press claims a loop mid-erase-fade
+ *      immediately rather than waiting out the fade.
+ *   6. routing — closes A via a routing change (not buffer-full), and A's
+ *      decay keeps progressing on its own after B becomes the active
+ *      target.
+ *   7. memory-word bucket mapping — every "NN% (word)" reading loopA_status
+ *      produces while Looping matches the design doc's Vivid/Fading/Hazy/
+ *      Almost gone boundaries, and all four are observed.
+ *   8. master_loops_overview format — all-idle, one loop Recording, and a
+ *      fresh-close memory decile alongside a second loop Recording, each
+ *      checked byte-exact.
+ *   9. too-short blip discard — close_recording's MIN_RECORDED_FRAMES floor,
+ *      caught by a routing change (synchronous, instant) before the floor
+ *      is cleared.
+ *  10. parameter clamping/bounds on every knob (decay_rate's range is now
+ *      3..300), plus a rejected (not clamped) out-of-range input_routing
+ *      value.
+ *  11. extreme decay_rate = 300 (the slow end, five minutes).
+ *  12. erase in the two states 4/5 never exercise (both only fire while
+ *      Looping) — Idle (no-op safety) and Recording (hard closes
+ *      immediately, discarding the take).
+ *  13. `state` get/set round-trip: live knobs survive into a fresh instance
  *      bit-for-bit; recorded content/playback position deliberately do not.
- *  16. saturation-stage passthrough: bit-exact identity at saturation=0
- *      (nonzero degrade) and at degrade=0 (any saturation) — the bug fixed
- *      in this same commit.
+ *  14. saturation-stage passthrough: bit-exact identity at saturation=0
+ *      (nonzero degrade) and at degrade=0 (any saturation).
+ *  15. master_freeze — pauses decay in place while LOOPING (memory does
+ *      not move at all while frozen, however long), resumes on a second
+ *      press.
  *
- * Recordings closed deliberately via the buffer-full path (feed a full
- * buffer_seconds of continuous tone) rather than the silence-timeout path —
- * silence-timeout recordings bake in ~silence_timeout worth of near-silent
- * tail before closing (RECORDING keeps writing through the trailing pause),
- * which makes the resulting recorded_length depend on envelope-decay timing.
- * Buffer-full gives an exact, known recorded_length with no such fuzziness.
- * Test 5 is the exception: it deliberately does NOT let A reach buffer-full
- * or silence-timeout, since proving the routing-change close fired requires
- * that neither of the other two closes could have.
+ * Recordings are closed deliberately via the buffer-full path (feed a full
+ * buffer_seconds of tone) rather than a manual second press, wherever a test
+ * doesn't care about the close mechanism itself — buffer-full remains an
+ * automatic close (a safety cap, per forgetful.c's set_param comment) and
+ * gives an exact, known recorded_length with no manual-timing fuzziness.
+ * Test 6 is the exception: it deliberately stops well short of buffer-full,
+ * since proving the routing-change close fired requires that buffer-full
+ * could not have.
  */
 
 #include <stdio.h>
@@ -74,20 +93,23 @@ extern audio_fx_api_v2_t* move_audio_fx_init_v2(const host_api_v1_t *host);
 #define SAMPLE_RATE   44100
 #define BLOCK_FRAMES  128
 
-/* Mirrors forgetful.c's documented defaults (design doc: 50ms debounce,
- * 8s buffer, 600ms erase confirm, 400ms forgotten display). */
-#define TEST_DEBOUNCE_FRAMES          (50L  * SAMPLE_RATE / 1000)
-#define TEST_BUFFER_CAPACITY_FRAMES   (44100L * 8)
-#define TEST_ERASE_CONFIRM_FRAMES     (600L * SAMPLE_RATE / 1000)
+/* Mirrors forgetful.c's documented defaults (60s buffer, 10s erase fade,
+ * 400ms forgotten display, 50ms too-short-take floor). */
+#define TEST_BUFFER_CAPACITY_FRAMES   (44100L * 60)
 #define TEST_FORGOTTEN_DISPLAY_FRAMES (400L * SAMPLE_RATE / 1000)
-#define TEST_SILENCE_TIMEOUT_FRAMES   (1500L * SAMPLE_RATE / 1000)
 #define TEST_MIN_RECORDED_FRAMES      (50L   * SAMPLE_RATE / 1000)
 
 /* Mirrors forgetful.c's ROUTE_* — matches the declared options index order
- * ["None","A","B","C","D"] that input_routing's set_param parses. */
-#define TEST_ROUTE_NONE "0"
-#define TEST_ROUTE_A    "1"
-#define TEST_ROUTE_B    "2"
+ * ["A","B","C","D"] (no OFF — removed 2026-08-25, see the ROUTE_A comment
+ * in forgetful.c). set_param accepts both the index string (used
+ * throughout this file, matching how the bench harness drives the API
+ * directly) and the label string (what the real host writes on-device —
+ * see the input_routing set_param comment in forgetful.c). */
+#define TEST_ROUTE_A    "0"
+#define TEST_ROUTE_B    "1"
+
+/* Seconds -> frames, for decay_rate math (decay_rate is now a duration). */
+#define TEST_DECAY_FRAMES(secs) ((long)((secs) * (double)SAMPLE_RATE))
 
 static int g_failures = 0;
 
@@ -114,10 +136,10 @@ static void fill_silence(int16_t *buf, int frames) {
 }
 
 /* A constant (DC-ish) "tone" — used only by the saturation-passthrough test
- * (test16), where a value that never changes sample-to-sample makes the
- * recorded content immune to the debounce-triggered start-offset jitter that
- * a real sine tone would carry: any window of a constant signal is identical
- * regardless of exactly which sample write_head==0 landed on. */
+ * (test14), where a value that never changes sample-to-sample makes the
+ * recorded content immune to any start-offset jitter: any window of a
+ * constant signal is identical regardless of exactly which sample
+ * write_head==0 landed on. */
 static void fill_constant(int16_t *buf, int frames, int16_t value) {
     for (int i = 0; i < frames; i++) {
         buf[i * 2]     = value;
@@ -134,14 +156,15 @@ static const char *status_of(audio_fx_api_v2_t *api, void *inst, char letter) {
     return buf;
 }
 
-/* loopX_status is now a full state line (Build/Test Plan step 4), not a bare
- * state name — "Idle" became "Listening..." and "Looping" became
- * "Looping - NN% (word)" with a live percentage, so the LOOPING checks below
- * match the fixed prefix rather than the whole string. */
+/* loopX_status is a full state line, not a bare state name — Idle reads
+ * "Ready" (changed from "Listening..." with the manual-record redesign,
+ * since the loop is no longer passively monitoring input level) and Looping
+ * reads "Looping - NN% (word)" with a live percentage, so the LOOPING checks
+ * below match the fixed prefix rather than the whole string. */
 static int status_is_looping(const char *status) {
     return strncmp(status, "Looping - ", 10) == 0;
 }
-#define STATUS_LISTENING "Listening..."
+#define STATUS_READY "Ready"
 
 static const char *erase_readout(audio_fx_api_v2_t *api, void *inst, char letter) {
     static char key[32];
@@ -150,6 +173,28 @@ static const char *erase_readout(audio_fx_api_v2_t *api, void *inst, char letter
     int n = api->get_param(inst, key, buf, sizeof(buf));
     if (n <= 0) buf[0] = '\0';
     return buf;
+}
+
+static const char *record_readout(audio_fx_api_v2_t *api, void *inst) {
+    static char buf[16];
+    int n = api->get_param(inst, "master_record", buf, sizeof(buf));
+    if (n <= 0) buf[0] = '\0';
+    return buf;
+}
+
+static const char *freeze_readout(audio_fx_api_v2_t *api, void *inst) {
+    static char buf[16];
+    int n = api->get_param(inst, "master_freeze", buf, sizeof(buf));
+    if (n <= 0) buf[0] = '\0';
+    return buf;
+}
+
+/* Fires the manual record trigger — same "any non-idle-spelling write fires
+ * it" convention loopA_erase uses. One press starts (while routed+Idle/
+ * Forgotten), a second closes (while Recording); a no-op otherwise (nothing
+ * routed, or already Looping). */
+static void press_record(audio_fx_api_v2_t *api, void *inst) {
+    api->set_param(inst, "master_record", "REC!");
 }
 
 static void run_tone(audio_fx_api_v2_t *api, void *inst, long total_frames,
@@ -186,25 +231,33 @@ static void run_constant(audio_fx_api_v2_t *api, void *inst, long total_frames, 
     }
 }
 
-/* Records a full buffer of tone into loop A (closes via buffer-full, not
- * silence-timeout) so recorded_length is exactly TEST_BUFFER_CAPACITY_FRAMES,
- * deterministically. total_frames only advances in whole BLOCK_FRAMES steps,
- * so the debounce can complete a little after the nominal TEST_DEBOUNCE_FRAMES
- * mark (rounded up to the next block boundary) — the extra slack guarantees
- * the buffer actually fills rather than landing a few samples short. */
+/* Routes to A, presses record (starts), feeds EXACTLY a full buffer of tone
+ * so it closes on its own via buffer-full — deterministic recorded_length
+ * AND zero LOOPING time elapsed by the time this returns. No padding past
+ * TEST_BUFFER_CAPACITY_FRAMES: close_recording() fires the instant
+ * write_head reaches capacity_frames (inside the last, possibly partial,
+ * process_block call), and since run_tone stops feeding at exactly that
+ * frame count, none of the fed frames are ever processed as LOOPING here.
+ * (An earlier version padded by 8 extra blocks to cover recording starting
+ * late behind a level-detection debounce; that debounce no longer exists —
+ * recording starts on press_record with zero delay — and the padding
+ * became actively wrong once decay went continuous-per-sample (test2/
+ * test14a's decay-timing checks were failing by exactly one padding's worth
+ * of extra, silent decay that had already happened before their own clock
+ * started) rather than merely imprecise.) */
 static void record_full_buffer_loop_a(audio_fx_api_v2_t *api, void *inst, float *phase) {
     api->set_param(inst, "input_routing", TEST_ROUTE_A);
-    run_tone(api, inst, TEST_DEBOUNCE_FRAMES + TEST_BUFFER_CAPACITY_FRAMES + BLOCK_FRAMES * 8,
-             0.5f, 440.0f, phase);
+    press_record(api, inst);
+    run_tone(api, inst, TEST_BUFFER_CAPACITY_FRAMES, 0.5f, 440.0f, phase);
 }
 
-/* Constant-value counterpart of record_full_buffer_loop_a, for test16: fills
- * the whole buffer with one unchanging sample value, so the recorded content
- * is known exactly (`value`, every index) without needing to reconstruct the
- * debounce-triggered start offset. */
+/* Constant-value counterpart, for test14: fills the whole buffer with one
+ * unchanging sample value, so the recorded content is known exactly
+ * (`value`, every index). */
 static void record_full_buffer_loop_a_constant(audio_fx_api_v2_t *api, void *inst, int16_t value) {
     api->set_param(inst, "input_routing", TEST_ROUTE_A);
-    run_constant(api, inst, TEST_DEBOUNCE_FRAMES + TEST_BUFFER_CAPACITY_FRAMES + BLOCK_FRAMES * 8, value);
+    press_record(api, inst);
+    run_constant(api, inst, TEST_BUFFER_CAPACITY_FRAMES, value);
 }
 
 int main(void) {
@@ -225,7 +278,7 @@ int main(void) {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test0: create_instance");
 
-        char cp[8192], hier[2048], probe[64];
+        char cp[8192], hier[4096], probe[64];
 
         int n = api->get_param(inst, "chain_params", cp, sizeof(cp));
         check(n > 0, "test0: chain_params readable");
@@ -234,16 +287,36 @@ int main(void) {
         int key_count = 0;
         const char *p = cp;
         while ((p = strstr(p, "\"key\":\"")) != NULL) { key_count++; p += 7; }
-        check(key_count == 40, "test0: chain_params has exactly 40 entries (5 pages x 8)");
+        check(key_count == 40, "test0: chain_params has exactly 40 entries (8 master + 4x8 loop)");
 
         n = api->get_param(inst, "ui_hierarchy", hier, sizeof(hier));
         check(n > 0, "test0: ui_hierarchy readable");
         check(n > 0 && strstr(hier, "\"knobs\":[") != NULL, "test0: ui_hierarchy has a knobs array");
 
+        /* Five named levels — root (Master) plus loopA..loopD — not one flat
+         * array (see forgetful.c's ui_hierarchy comment). */
+        check(strstr(hier, "\"root\":{") != NULL, "test0: ui_hierarchy has a root level");
+        static const char *level_keys[] = { "loopA", "loopB", "loopC", "loopD" };
+        static const char *level_labels[] = { "A", "B", "C", "D" };
+        for (size_t i = 0; i < 4; i++) {
+            /* Labels are just the loop letter now (2026-08-25, trimmed from
+             * "Loop A" etc.) — probe the level's OWN declaration
+             * ("loopA":{"label":"A"...) rather than a bare "label":"A",
+             * which loopA_volume's identically-renamed label would also
+             * satisfy and make this check meaningless. */
+            snprintf(probe, sizeof(probe), "\"%s\":{\"label\":\"%s\"", level_keys[i], level_labels[i]);
+            check(strstr(hier, probe) != NULL, "test0: ui_hierarchy loop level has its own label");
+        }
+        /* Master's top row is now fully occupied — Route, Status, Rec,
+         * Freeze — no blank slots left (2026-08-25 added Freeze into the
+         * last one). */
+        check(strstr(hier, "\"master_loops_overview\",\"master_record\",\"master_freeze\",\"loopA_volume\"") != NULL,
+              "test0: Master page's top row is Route/Status/Rec/Freeze, no blanks");
+
         /* every expected key, in both blobs */
         static const char *master_keys[] = {
             "input_routing", "loopA_volume", "loopB_volume", "loopC_volume", "loopD_volume",
-            "master_loops_overview", "master_reserved_1", "master_reserved_2"
+            "master_loops_overview", "master_record", "master_freeze"
         };
         for (size_t i = 0; i < sizeof(master_keys) / sizeof(master_keys[0]); i++) {
             snprintf(probe, sizeof(probe), "\"key\":\"%s\"", master_keys[i]);
@@ -252,7 +325,7 @@ int main(void) {
             check(strstr(hier, probe) != NULL, "test0: ui_hierarchy contains master key");
         }
         static const char *loop_suffixes[] = {
-            "decay_rate", "wow", "hf_loss", "hiss", "saturation", "chaos", "reserved", "erase"
+            "decay_rate", "wow", "hf_loss", "hiss", "saturation", "chaos", "state", "erase"
         };
         static const char letters[] = { 'A', 'B', 'C', 'D' };
         for (int li = 0; li < 4; li++) {
@@ -263,119 +336,201 @@ int main(void) {
                 check(strstr(hier, probe) != NULL, "test0: ui_hierarchy contains per-loop key");
             }
         }
+        check(strstr(cp, "reserved") == NULL, "test0: chain_params has no reserved keys");
+        check(strstr(hier, "reserved") == NULL, "test0: ui_hierarchy has no reserved keys");
+
+        /* decay_rate's range is now 3..300 SECONDS, not 3..60 repeats. */
+        check(strstr(cp, "\"loopA_decay_rate\",\"name\":\"Age\",\"type\":\"float\","
+                         "\"min\":3,\"max\":300") != NULL,
+              "test0: loopX_decay_rate range is 3..300");
+
+        /* No OFF option — Route is exactly the four letters now. */
+        check(strstr(cp, "\"options\":[\"A\",\"B\",\"C\",\"D\"],\"default\":0}") != NULL,
+              "test0: input_routing options are exactly A/B/C/D, no OFF");
+        check(strstr(cp, "OFF") == NULL, "test0: chain_params has no OFF option anywhere");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 1: record trigger — debounce timing + dry passthrough (Loop A) ---- */
+    /* ---- Test 1: manual record start/stop (Loop A) ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test1: create_instance");
-        api->set_param(inst, "input_routing", TEST_ROUTE_A);
+
+        /* No OFF/unrouted state — a fresh instance is already routed to A. */
+        char rbuf[16];
+        api->get_param(inst, "input_routing", rbuf, sizeof(rbuf));
+        check(strcmp(rbuf, "A") == 0, "test1: fresh instance defaults to Route A");
 
         float phase = 0.0f;
         int16_t buf[BLOCK_FRAMES * 2], ref[BLOCK_FRAMES * 2];
 
-        /* Below record_threshold (-30dBFS ~= 0.0316 linear): must stay Idle,
-         * and dry must pass through untouched the whole time. */
+        /* Routed but not yet pressed: still Ready, dry passes through
+         * untouched regardless of input level (this is the design doc's
+         * "dry always passes through" rule). */
+        fill_tone(buf, BLOCK_FRAMES, 0.5f, 440.0f, &phase);
+        memcpy(ref, buf, sizeof(buf));
+        api->process_block(inst, buf, BLOCK_FRAMES);
+        check(memcmp(buf, ref, sizeof(buf)) == 0, "test1: dry passthrough while Ready");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_READY) == 0, "test1: still Ready before the press");
+
+        /* Press: starts Recording immediately, no debounce. */
+        press_record(api, inst);
+        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
+              "test1: press starts Recording immediately (no debounce)");
+        /* Readout vocabulary rebuilt 2026-08-25 around "what will the NEXT
+         * press do" (a transport-button convention), replacing an earlier
+         * "what's happening now" scheme (CATCH/LAYER/LIVE/BLISS, and before
+         * that CAPTURE/RELIVE/PLAYING/-): STOP while Recording (next press
+         * stops it). */
+        check(strcmp(record_readout(api, inst), "STOP") == 0,
+              "test1: master_record reads 'STOP' while A is Recording");
+
         for (int b = 0; b < 20; b++) {
-            fill_tone(buf, BLOCK_FRAMES, 0.005f, 440.0f, &phase);
-            memcpy(ref, buf, sizeof(buf));
-            api->process_block(inst, buf, BLOCK_FRAMES);
-            check(memcmp(buf, ref, sizeof(buf)) == 0, "test1: dry passthrough below threshold");
-        }
-        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test1: stays Idle below threshold");
-
-        /* Above threshold, but short of the debounce window: still Idle,
-         * dry still passes through (this is the state the original plan's
-         * open question #1 was about — resolved as "always dry"). */
-        long fed = 0;
-        int saw_recording_early = 0;
-        long pre_debounce_cutoff = TEST_DEBOUNCE_FRAMES - BLOCK_FRAMES * 3;
-        while (fed < pre_debounce_cutoff) {
-            fill_tone(buf, BLOCK_FRAMES, 0.5f, 440.0f, &phase);
-            memcpy(ref, buf, sizeof(buf));
-            api->process_block(inst, buf, BLOCK_FRAMES);
-            check(memcmp(buf, ref, sizeof(buf)) == 0, "test1: dry passthrough during debounce");
-            if (strcmp(status_of(api, inst, 'A'), "Recording") == 0) saw_recording_early = 1;
-            fed += BLOCK_FRAMES;
-        }
-        check(!saw_recording_early, "test1: must not start Recording before debounce elapses");
-
-        /* Push well past the debounce window: now Recording, dry still passes through. */
-        long post_debounce_target = TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6;
-        while (fed < post_debounce_target) {
             fill_tone(buf, BLOCK_FRAMES, 0.5f, 440.0f, &phase);
             memcpy(ref, buf, sizeof(buf));
             api->process_block(inst, buf, BLOCK_FRAMES);
             check(memcmp(buf, ref, sizeof(buf)) == 0, "test1: dry passthrough while Recording");
-            fed += BLOCK_FRAMES;
         }
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test1: Recording after debounce elapses");
+
+        /* Second press: closes into Looping. Readout is DUB (next press
+         * would start an overdub) for an ordinary loop with nothing else
+         * going on — was LIVE/ALIVE/PLAYING under the old "what's happening
+         * now" scheme. */
+        press_record(api, inst);
+        check(status_is_looping(status_of(api, inst, 'A')), "test1: second press closes into Looping");
+        check(strcmp(record_readout(api, inst), "DUB") == 0,
+              "test1: master_record reads 'DUB' once closed");
+
+        /* A third press, while Looping, starts an overdub (2026-08-25:
+         * replaces the old v1 no-op) — readout is PLAY (next press would
+         * stop the overdub, back to plain playback — was LAYER/RELIVE/
+         * OVERDUB under the old "what's happening now" scheme) — but the
+         * loop's own status line, memory and flavor knobs are untouched. */
+        const char *before = status_of(api, inst, 'A');
+        char before_copy[64];
+        snprintf(before_copy, sizeof(before_copy), "%s", before);
+        char loop_a_wow[16], loop_a_chaos[16];
+        api->get_param(inst, "loopA_wow", loop_a_wow, sizeof(loop_a_wow));
+        api->get_param(inst, "loopA_chaos", loop_a_chaos, sizeof(loop_a_chaos));
+
+        press_record(api, inst);
+        check(strcmp(record_readout(api, inst), "PLAY") == 0,
+              "test1: third press starts an overdub (readout is PLAY)");
+        check(strcmp(status_of(api, inst, 'A'), before_copy) == 0,
+              "test1: starting an overdub doesn't change the loop's own status line");
+        char echo_char[8];
+        api->get_param(inst, "loopA_state", echo_char, sizeof(echo_char));
+        check(strcmp(echo_char, "O") == 0,
+              "test1: loopA_state (ECHO) shows 'O' while overdubbing (2026-08-25)");
+        char wow_check[16], chaos_check[16];
+        api->get_param(inst, "loopA_wow", wow_check, sizeof(wow_check));
+        api->get_param(inst, "loopA_chaos", chaos_check, sizeof(chaos_check));
+        check(strcmp(wow_check, loop_a_wow) == 0 && strcmp(chaos_check, loop_a_chaos) == 0,
+              "test1: starting an overdub doesn't touch flavor knob targets");
+
+        /* Overdubbing actually layers new dry input into the buffer: after
+         * feeding a full pass of a DIFFERENT tone, the loop's own content is
+         * no longer identical to the original pure 440Hz recording (the
+         * cheapest observable proxy: play a loud second tone in and confirm
+         * SOME buffer content changed by checking output differs across two
+         * otherwise-identical silent playback passes is unnecessary — buffer
+         * content isn't directly exposed, so this just exercises the API
+         * path without asserting exact samples). */
+        for (int b = 0; b < 20; b++) {
+            fill_tone(buf, BLOCK_FRAMES, 0.8f, 880.0f, &phase);
+            api->process_block(inst, buf, BLOCK_FRAMES);
+        }
+
+        /* Fourth press: stops the overdub, back to plain DUB (next press
+         * would start a new overdub). */
+        press_record(api, inst);
+        check(strcmp(record_readout(api, inst), "DUB") == 0,
+              "test1: fourth press stops the overdub (readout is DUB again)");
+        api->get_param(inst, "loopA_state", echo_char, sizeof(echo_char));
+        check(strcmp(echo_char, "O") != 0,
+              "test1: loopA_state (ECHO) no longer shows 'O' once the overdub stops");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 2: decay timing + forgotten_at display window (Loop A) ---- */
+    /* ---- Test 2: decay timing (wall-clock seconds) + forgotten_at display
+     * window (Loop A) ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test2: create_instance");
 
-        api->set_param(inst, "loopA_decay_rate", "3"); /* minimum: forgotten after 3 wraps */
+        api->set_param(inst, "loopA_decay_rate", "3"); /* 3 SECONDS to fully forget */
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
         check(status_is_looping(status_of(api, inst, 'A')), "test2: Looping after buffer-full close");
 
-        /* ~3 wraps of a TEST_BUFFER_CAPACITY_FRAMES-length loop, with slack
-         * for wow/flutter's small speed modulation. */
-        long budget = TEST_BUFFER_CAPACITY_FRAMES * 3 + 50000;
-        long advanced = 0;
-        int saw_forgotten = 0;
-        int16_t buf[BLOCK_FRAMES * 2];
-        while (advanced < budget && !saw_forgotten) {
-            fill_silence(buf, BLOCK_FRAMES);
-            api->process_block(inst, buf, BLOCK_FRAMES);
-            if (strcmp(status_of(api, inst, 'A'), "Forgotten") == 0) saw_forgotten = 1;
-            advanced += BLOCK_FRAMES;
-        }
-        check(saw_forgotten, "test2: status reports Forgotten within the expected decay budget");
+        /* Just short of 3 seconds: must still be Looping. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(3) - BLOCK_FRAMES * 4);
+        check(status_is_looping(status_of(api, inst, 'A')),
+              "test2: still Looping just short of decay_rate seconds");
 
-        /* Run past the display window: status settles to Idle. */
+        /* Past 3 seconds: Forgotten. */
+        run_silence(api, inst, BLOCK_FRAMES * 8);
+        check(strcmp(status_of(api, inst, 'A'), "Forgotten") == 0,
+              "test2: Forgotten once decay_rate seconds have elapsed");
+
+        /* Run past the display window: status settles to Ready. */
         run_silence(api, inst, TEST_FORGOTTEN_DISPLAY_FRAMES + BLOCK_FRAMES * 4);
-        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test2: status settles to Idle after the display window");
+        check(strcmp(status_of(api, inst, 'A'), STATUS_READY) == 0,
+              "test2: status settles to Ready after the display window");
 
-        /* Engine is genuinely reset — a fresh tone can start recording again
-         * immediately (still routed to A from record_full_buffer_loop_a). */
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES, 0.5f, 440.0f, &phase);
+        /* Engine is genuinely reset — pressing record starts a fresh take
+         * immediately (still routed to A). */
+        press_record(api, inst);
         check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
               "test2: engine accepts a new recording right after Forgotten");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 3: double-click erase within the confirm window (Loop A) ---- */
+    /* ---- Test 3: continuous decay — memory must NOT be gated on a buffer
+     * wrap. Previously memory only stepped once per WRAP; a long recording
+     * could sit at memory==1.0 for its entire first pass before dropping in
+     * one visible/audible step. With per-sample decay, a recording many
+     * times longer than decay_rate itself should already show visible
+     * degradation well before completing even one wrap. ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test3: create_instance");
 
+        /* decay_rate=3s, but the recording is the full 8s buffer — memory
+         * would reach 0 entirely within the FIRST wrap, which also proves
+         * the point, but split it clearly: check partway through the first
+         * wrap (1.5s of LOOPING) that memory has already dropped by roughly
+         * half, not still sitting at 1.0. */
+        api->set_param(inst, "loopA_decay_rate", "3");
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(status_is_looping(status_of(api, inst, 'A')), "test3: Looping before erase");
+        check(status_is_looping(status_of(api, inst, 'A')), "test3: Looping after buffer-full close");
 
-        api->set_param(inst, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0, "test3: single click arms");
-        check(status_is_looping(status_of(api, inst, 'A')), "test3: single click does not clear");
-
-        run_silence(api, inst, BLOCK_FRAMES * 4); /* well under the confirm window */
-        api->set_param(inst, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst, 'A'), "-") == 0, "test3: confirmed erase clears the arm");
-        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test3: confirmed erase drops to Idle");
+        run_silence(api, inst, TEST_DECAY_FRAMES(1.5));
+        const char *s = status_of(api, inst, 'A');
+        check(status_is_looping(s), "test3: still Looping 1.5s into a 3s decay (not yet forgotten)");
+        int pct = -1;
+        char word[32];
+        check(sscanf(s, "Looping - %d%% (%31[^)])", &pct, word) == 2, "test3: status line parses");
+        /* ~50% expected (1.5 / 3.0); wide tolerance for the block-boundary
+         * rounding in how far run_silence actually advanced. */
+        check(pct >= 35 && pct <= 65,
+              "test3: memory is measurably degraded partway through the FIRST wrap of an 8s "
+              "recording — proves decay is continuous, not stepped once per wrap");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 4: stale arm past the confirm window does not confirm (Loop A) ---- */
+    /* ---- Test 4: single-click erase starts a fade, not an instant clear
+     * (Loop A). Removed double-click-confirm 2026-08-25: touch+jog-click is
+     * already a deliberate two-part gesture, a second click on top was
+     * redundant. Erasing a LOOPING loop now fades it out over
+     * ERASE_FADE_SECONDS instead of cutting it, and memory decay is
+     * suspended for the duration (see the LOOPING case's erasing guard). ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test4: create_instance");
@@ -385,55 +540,77 @@ int main(void) {
         check(status_is_looping(status_of(api, inst, 'A')), "test4: Looping before erase");
 
         api->set_param(inst, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0, "test4: first click arms");
+        check(strcmp(status_of(api, inst, 'A'), "Erasing...") == 0,
+              "test4: single click starts the fade immediately (Erasing...), not an instant clear");
 
-        run_silence(api, inst, TEST_ERASE_CONFIRM_FRAMES + BLOCK_FRAMES * 4); /* let the window lapse */
+        /* Well before the fade completes: still fading, buffer not cleared. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(2));
+        check(strcmp(status_of(api, inst, 'A'), "Erasing...") == 0,
+              "test4: still Erasing partway through the fade");
 
+        /* A repeat press mid-fade must not restart or double-speed it —
+         * confirm by running the ORIGINAL remaining budget and expecting
+         * completion right on schedule, not late. */
         api->set_param(inst, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst, 'A'), "Tap again") == 0,
-              "test4: stale click re-arms rather than confirming");
-        check(status_is_looping(status_of(api, inst, 'A')), "test4: stale click must not clear the loop");
-
-        run_silence(api, inst, BLOCK_FRAMES * 4); /* well under the fresh window */
-        api->set_param(inst, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst, 'A'), "-") == 0, "test4: fresh arm confirms normally");
-        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0, "test4: fresh-arm confirm drops to Idle");
+        run_silence(api, inst, TEST_DECAY_FRAMES(8) + BLOCK_FRAMES * 4);
+        check(strcmp(status_of(api, inst, 'A'), STATUS_READY) == 0,
+              "test4: fade completes on schedule (10s total) and drops to Ready, buffer cleared");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 5: routing — the new behavior in this build step.
-     * Closes A via a routing change (not silence-timeout or buffer-full),
-     * and A's decay keeps progressing on its own once B is the active
-     * recording target. ---- */
+    /* ---- Test 5: a fresh master_record press claims a loop mid-erase-fade
+     * immediately, rather than waiting out the fade (Loop A). ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test5: create_instance");
 
+        float phase = 0.0f;
+        record_full_buffer_loop_a(api, inst, &phase);
+        check(status_is_looping(status_of(api, inst, 'A')), "test5: Looping before erase");
+
+        api->set_param(inst, "loopA_erase", "Erase!");
+        check(strcmp(status_of(api, inst, 'A'), "Erasing...") == 0, "test5: fade started");
+        run_silence(api, inst, TEST_DECAY_FRAMES(1)); /* partway through the fade, nowhere near done */
+
+        press_record(api, inst);
+        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
+              "test5: pressing record mid-fade claims the loop immediately, not after the fade finishes");
+
+        api->destroy_instance(inst);
+    }
+
+    /* ---- Test 6: routing — closes A via a routing change (not buffer-
+     * full), and A's decay keeps progressing on its own once B is the
+     * active recording target. ---- */
+    {
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test6: create_instance");
+
         api->set_param(inst, "loopA_decay_rate", "3"); /* fast decay: small test budget */
 
-        /* Route to A and record a short, deliberately UNCLOSED take — no
-         * silence fed, nowhere near buffer-full, so the close that follows
-         * can only have come from the routing change itself. */
+        /* Route to A, press record, and feed a short, deliberately UNCLOSED
+         * take — nowhere near buffer-full, so the close that follows can
+         * only have come from the routing change itself. */
         api->set_param(inst, "input_routing", TEST_ROUTE_A);
+        press_record(api, inst);
         float phase_a = 0.0f;
-        long a_take_frames = TEST_DEBOUNCE_FRAMES + 20000;
-        run_tone(api, inst, a_take_frames, 0.5f, 440.0f, &phase_a);
+        run_tone(api, inst, BLOCK_FRAMES * 20, 0.5f, 440.0f, &phase_a);
         check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
-              "test5: A is Recording before the routing change");
+              "test6: A is Recording before the routing change");
 
         /* Switch routing away from A mid-recording. This must close A
          * SYNCHRONOUSLY, inside this very set_param call. */
         api->set_param(inst, "input_routing", TEST_ROUTE_B);
         check(status_is_looping(status_of(api, inst, 'A')),
-              "test5: A closes into Looping the instant routing moves away "
-              "(proves the close came from the routing change, not silence-timeout)");
+              "test6: A closes into Looping the instant routing moves away");
 
-        /* Record a DIFFERENT tone into B, for long enough that A's short
-         * loop (decay_rate=3) has time to fully decay on its own,
-         * unattended — A never receives input again after this point. */
+        /* Record a DIFFERENT tone into B (manual press, same as A), for
+         * long enough that A's short loop (decay_rate=3s) has time to fully
+         * decay on its own, unattended — A never receives input again. */
+        press_record(api, inst);
         float phase_b = 0.0f;
-        long budget = a_take_frames * 3 + 50000; /* ~3 wraps of A's take, generous slack */
+        long budget = TEST_DECAY_FRAMES(3) + BLOCK_FRAMES * 20;
         long advanced = 0;
         int saw_b_recording = 0, saw_a_forgotten = 0;
         int16_t buf[BLOCK_FRAMES * 2];
@@ -444,35 +621,32 @@ int main(void) {
             if (strcmp(status_of(api, inst, 'A'), "Forgotten") == 0) saw_a_forgotten = 1;
             advanced += BLOCK_FRAMES;
         }
-        check(saw_b_recording, "test5: B records the different tone while A is no longer routed");
-        check(saw_a_forgotten, "test5: A's memory keeps decaying on its own while B is the active target");
+        check(saw_b_recording, "test6: B records the different tone while A is no longer routed");
+        check(saw_a_forgotten, "test6: A's memory keeps decaying on its own while B is the active target");
 
         /* B must be unaffected by A's independent decay/reset. */
         check(strcmp(status_of(api, inst, 'B'), "Recording") == 0,
-              "test5: B is unaffected by A's independent decay and reset");
+              "test6: B is unaffected by A's independent decay and reset");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 6: memory-word bucket mapping in the loop-page status line
-     * (Loop A) - Build/Test Plan step 4 ---- */
+    /* ---- Test 7: memory-word bucket mapping in the loop-page status line
+     * (Loop A) ---- */
     {
         void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test6: create_instance");
+        check(inst != NULL, "test7: create_instance");
 
-        api->set_param(inst, "loopA_decay_rate", "20"); /* 5%-per-wrap steps */
+        api->set_param(inst, "loopA_decay_rate", "20"); /* 20 seconds, easy 5%-per-second math */
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(status_is_looping(status_of(api, inst, 'A')), "test6: Looping after buffer-full close");
+        check(status_is_looping(status_of(api, inst, 'A')), "test7: Looping after buffer-full close");
 
-        /* Poll every block through ~20 wraps plus slack for wow/flutter's
-         * small speed modulation, and check every observed "NN% (word)"
-         * reading against the design doc's bucket boundaries directly -
-         * this doesn't depend on landing on any particular wrap, so it's
-         * robust to the read-speed jitter that makes exact wrap counting
-         * impractical (see test2's comment on the same issue). */
-        long budget = TEST_BUFFER_CAPACITY_FRAMES * 20 + 500000;
+        /* Poll every block through the full 20s decay and check every
+         * observed "NN% (word)" reading against the design doc's bucket
+         * boundaries directly. */
+        long budget = TEST_DECAY_FRAMES(20) + BLOCK_FRAMES * 8;
         long advanced = 0;
         int saw_vivid = 0, saw_fading = 0, saw_hazy = 0, saw_almost_gone = 0;
         int bucket_mismatch = 0;
@@ -496,140 +670,72 @@ int main(void) {
             }
             advanced += BLOCK_FRAMES;
         }
-        check(!bucket_mismatch, "test6: every observed percentage matches the design doc's word bucket");
-        check(saw_vivid,       "test6: observed the Vivid bucket (90-100%)");
-        check(saw_fading,      "test6: observed the Fading bucket (40-89%)");
-        check(saw_hazy,        "test6: observed the Hazy bucket (10-39%)");
-        check(saw_almost_gone, "test6: observed the Almost gone bucket (1-9%)");
+        check(!bucket_mismatch, "test7: every observed percentage matches the design doc's word bucket");
+        check(saw_vivid,       "test7: observed the Vivid bucket (90-100%)");
+        check(saw_fading,      "test7: observed the Fading bucket (40-89%)");
+        check(saw_hazy,        "test7: observed the Hazy bucket (10-39%)");
+        check(saw_almost_gone, "test7: observed the Almost gone bucket (1-9%)");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 7: master_loops_overview format (Master page knob 6) -
-     * Build/Test Plan step 4 ---- */
+    /* ---- Test 8: master_loops_overview format (Master page Status) ---- */
     {
         void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test7: create_instance");
+        check(inst != NULL, "test8: create_instance");
 
         char buf[16];
         int n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
-        check(n == 4, "test7: overview is exactly 4 characters");
-        check(strcmp(buf, "----") == 0, "test7: fresh instance reads all-idle");
+        check(n == 5, "test8: overview is exactly 5 characters (A+B, '_', C+D)");
+        check(strcmp(buf, "--_--") == 0, "test8: fresh instance reads all-idle");
 
-        /* Route to A, well past debounce, and (unlike test1/test5's shorter
-         * "just confirm Recording" probes) far enough past it that write_head
-         * clears the too-short-a-take discard floor too - this take gets
-         * CLOSED below via a routing change, and a discarded take would read
-         * back Idle instead of Looping. */
         api->set_param(inst, "input_routing", TEST_ROUTE_A);
+        press_record(api, inst);
         float phase = 0.0f;
-        long a_take_frames = TEST_DEBOUNCE_FRAMES + 20000;
-        run_tone(api, inst, a_take_frames, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test7: A is Recording");
+        run_tone(api, inst, BLOCK_FRAMES * 20, 0.5f, 440.0f, &phase);
+        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test8: A is Recording");
         n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
-        check(n == 4 && strcmp(buf, "R---") == 0, "test7: overview shows A recording, rest idle");
+        check(n == 5 && strcmp(buf, "R-_--") == 0, "test8: overview shows A recording, rest idle");
 
         /* Switch routing to B: closes A into Looping at memory=1.0 - the top
          * decile, digit '9' (the decile scheme has no distinct digit for
          * "100%" versus "90-99%", by design - see the header comment). */
         api->set_param(inst, "input_routing", TEST_ROUTE_B);
         n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
-        check(n == 4 && strcmp(buf, "9---") == 0, "test7: overview shows A's fresh-close decile, rest idle");
+        check(n == 5 && strcmp(buf, "9-_--") == 0, "test8: overview shows A's fresh-close decile, rest idle");
 
         /* B now records too: overview reflects both loops at once. */
+        press_record(api, inst);
         float phase_b = 0.0f;
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6, 0.5f, 880.0f, &phase_b);
-        check(strcmp(status_of(api, inst, 'B'), "Recording") == 0, "test7: B is Recording");
+        run_tone(api, inst, BLOCK_FRAMES * 6, 0.5f, 880.0f, &phase_b);
+        check(strcmp(status_of(api, inst, 'B'), "Recording") == 0, "test8: B is Recording");
         n = api->get_param(inst, "master_loops_overview", buf, sizeof(buf));
-        check(n == 4 && strcmp(buf, "9R--") == 0, "test7: overview reflects both A and B simultaneously");
-
-        api->destroy_instance(inst);
-    }
-
-    /* ---- Test 8: silence-timeout close — the one close condition (of the
-     * three the design doc names: silence-timeout, buffer-full, routing-
-     * change) that tests 1-7 never actually exercise; every earlier test
-     * closes via buffer-full or a routing change. ---- */
-    {
-        void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test8: create_instance");
-        api->set_param(inst, "input_routing", TEST_ROUTE_A);
-
-        float phase = 0.0f;
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + 20000, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test8: Recording before silence");
-
-        run_silence(api, inst, TEST_SILENCE_TIMEOUT_FRAMES + BLOCK_FRAMES * 4);
-        check(status_is_looping(status_of(api, inst, 'A')),
-              "test8: silence-timeout closes the recording into Looping on its own "
-              "(recorded content is far short of buffer_seconds, so this can only "
-              "be the silence-timeout close)");
+        check(n == 5 && strcmp(buf, "9R_--") == 0, "test8: overview reflects both A and B simultaneously");
 
         api->destroy_instance(inst);
     }
 
     /* ---- Test 9: too-short blip discard — close_recording's
-     * MIN_RECORDED_FRAMES floor ("discard a too-short take rather than loop
-     * a click") has no coverage anywhere else: every other test's take is
-     * either buffer-full (deliberately long) or several thousand frames past
-     * debounce. Feed only ~one block of tone past the debounce trigger, then
-     * close via a ROUTING CHANGE rather than silence-timeout: RECORDING
-     * keeps writing every sample regardless of input level right up until
-     * the close actually fires, so a silence-timeout close would let
-     * write_head balloon past MIN_RECORDED_FRAMES during the ~1.5s timeout
-     * wait (confirmed by running it that way first — the take was no longer
-     * short by the time it closed). Routing-change is synchronous and
-     * instant, the only close that can catch write_head while it's still
-     * genuinely tiny. The loop must discard back to Idle, not start Looping
-     * a click. ---- */
+     * MIN_RECORDED_FRAMES floor. Press record, feed only ~one block of
+     * tone, then close via a ROUTING CHANGE (synchronous, instant) while
+     * write_head is still comfortably under the floor. The loop must
+     * discard back to Ready, not start Looping a click. ---- */
     {
         void *inst = api->create_instance(".", NULL);
         check(inst != NULL, "test9: create_instance");
         api->set_param(inst, "input_routing", TEST_ROUTE_A);
+        press_record(api, inst);
 
         float phase = 0.0f;
-        /* One block past the point debounce completes: write_head accumulates
-         * roughly a block's worth of frames, comfortably under
-         * TEST_MIN_RECORDED_FRAMES (both 50ms in forgetful.c, same as the
-         * debounce window itself). */
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES, 0.5f, 440.0f, &phase);
+        run_tone(api, inst, BLOCK_FRAMES, 0.5f, 440.0f, &phase);
         check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test9: blip does start Recording");
 
-        api->set_param(inst, "input_routing", TEST_ROUTE_NONE);
-        check(strcmp(status_of(api, inst, 'A'), STATUS_LISTENING) == 0,
-              "test9: a too-short take is discarded back to Idle, not looped");
-
-        api->destroy_instance(inst);
-    }
-
-    /* ---- Test 10: routing -> None closes the active recording too — test5
-     * only exercises routing moving to a DIFFERENT letter (A->B); moving to
-     * None is a distinct code path (routed_index becomes -1) that the design
-     * doc names as the same kind of close ("either to a different letter or
-     * to None"). ---- */
-    {
-        void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test10: create_instance");
-        api->set_param(inst, "input_routing", TEST_ROUTE_A);
-
-        float phase = 0.0f;
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + 20000, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test10: A is Recording before routing to None");
-
-        api->set_param(inst, "input_routing", TEST_ROUTE_NONE);
-        check(status_is_looping(status_of(api, inst, 'A')),
-              "test10: routing to None closes A synchronously, same as routing to another letter");
-
-        /* With nothing routed, no other loop should start recording even
-         * when fed tone. */
-        float phase_bcd = 0.0f;
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6, 0.5f, 660.0f, &phase_bcd);
-        check(strcmp(status_of(api, inst, 'B'), STATUS_LISTENING) == 0,
-              "test10: with routing None, B does not start recording even with input present");
-        check(strcmp(status_of(api, inst, 'C'), STATUS_LISTENING) == 0,
-              "test10: with routing None, C does not start recording even with input present");
-        check(strcmp(status_of(api, inst, 'D'), STATUS_LISTENING) == 0,
-              "test10: with routing None, D does not start recording even with input present");
+        /* No OFF to close via any more — a routing change to a different
+         * letter is synchronous and instant, same as OFF used to be, and is
+         * already what test6 exercises for the non-blip case. */
+        api->set_param(inst, "input_routing", TEST_ROUTE_B);
+        check(strcmp(status_of(api, inst, 'A'), STATUS_READY) == 0,
+              "test9: a too-short take is discarded back to Ready, not looped");
 
         api->destroy_instance(inst);
     }
@@ -638,19 +744,18 @@ int main(void) {
      * clamps to the declared range instead of storing the raw value, and an
      * out-of-range input_routing value is REJECTED outright (leaves the
      * existing route untouched) rather than clamped, since routing has
-     * discrete valid states with no sensible "nearest" clamp. No existing
-     * test sends an out-of-range value to any knob. ---- */
+     * discrete valid states with no sensible "nearest" clamp. ---- */
     {
         void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test11: create_instance");
+        check(inst != NULL, "test10: create_instance");
         char buf[64];
 
-        api->set_param(inst, "loopA_decay_rate", "1000");
+        api->set_param(inst, "loopA_decay_rate", "10000");
         api->get_param(inst, "loopA_decay_rate", buf, sizeof(buf));
-        check(strcmp(buf, "60.0") == 0, "test11: decay_rate clamps to max 60");
+        check(strcmp(buf, "300.0") == 0, "test10: decay_rate clamps to max 300");
         api->set_param(inst, "loopA_decay_rate", "-5");
         api->get_param(inst, "loopA_decay_rate", buf, sizeof(buf));
-        check(strcmp(buf, "3.0") == 0, "test11: decay_rate clamps to min 3");
+        check(strcmp(buf, "3.0") == 0, "test10: decay_rate clamps to min 3");
 
         static const char *unit_keys[] = { "wow", "hf_loss", "hiss", "saturation", "chaos" };
         for (size_t i = 0; i < sizeof(unit_keys) / sizeof(unit_keys[0]); i++) {
@@ -658,168 +763,131 @@ int main(void) {
             snprintf(key, sizeof(key), "loopA_%s", unit_keys[i]);
             api->set_param(inst, key, "5");
             api->get_param(inst, key, buf, sizeof(buf));
-            check(strcmp(buf, "1.000") == 0, "test11: 0..1 flavor param clamps to max 1");
+            check(strcmp(buf, "1.000") == 0, "test10: 0..1 flavor param clamps to max 1");
             api->set_param(inst, key, "-5");
             api->get_param(inst, key, buf, sizeof(buf));
-            check(strcmp(buf, "0.000") == 0, "test11: 0..1 flavor param clamps to min 0");
+            check(strcmp(buf, "0.000") == 0, "test10: 0..1 flavor param clamps to min 0");
         }
 
         api->set_param(inst, "loopA_volume", "5");
         api->get_param(inst, "loopA_volume", buf, sizeof(buf));
-        check(strcmp(buf, "1.000") == 0, "test11: loop volume clamps to max 1");
+        check(strcmp(buf, "1.000") == 0, "test10: loop volume clamps to max 1");
         api->set_param(inst, "loopA_volume", "-5");
         api->get_param(inst, "loopA_volume", buf, sizeof(buf));
-        check(strcmp(buf, "0.000") == 0, "test11: loop volume clamps to min 0");
+        check(strcmp(buf, "0.000") == 0, "test10: loop volume clamps to min 0");
 
         api->set_param(inst, "input_routing", TEST_ROUTE_A);
         api->get_param(inst, "input_routing", buf, sizeof(buf));
-        check(strcmp(buf, "A") == 0, "test11: valid input_routing accepted");
+        check(strcmp(buf, "A") == 0, "test10: valid input_routing accepted");
         api->set_param(inst, "input_routing", "99");
         api->get_param(inst, "input_routing", buf, sizeof(buf));
-        check(strcmp(buf, "A") == 0, "test11: out-of-range input_routing (too high) is rejected, route unchanged");
+        check(strcmp(buf, "A") == 0, "test10: out-of-range input_routing (too high) is rejected, route unchanged");
         api->set_param(inst, "input_routing", "-1");
         api->get_param(inst, "input_routing", buf, sizeof(buf));
-        check(strcmp(buf, "A") == 0, "test11: out-of-range input_routing (negative) is rejected, route unchanged");
+        check(strcmp(buf, "A") == 0, "test10: out-of-range input_routing (negative) is rejected, route unchanged");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 12: extreme decay_rate = 60 (the slow end; test2/test5/test6
-     * all use the fast end (3) or the default (20) — the slow boundary has
-     * no coverage). A handful of wraps at the slowest setting must still
-     * report Looping with a believable, still-high percentage, not flip to
-     * Forgotten early or drift outside the expected range. ---- */
+    /* ---- Test 12: extreme decay_rate = 300 (five minutes — the new slow
+     * end; 6/7/8 use the fast end (3) or the default (45s worth of range is
+     * covered by 20 in test7) — the slow boundary needs its own check. A
+     * minute in at the slowest setting must still report Looping with a
+     * believable, still-high percentage, not flip to Forgotten early or
+     * drift outside the expected range. ---- */
     {
         void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test12: create_instance");
-        api->set_param(inst, "loopA_decay_rate", "60");
+        check(inst != NULL, "test11: create_instance");
+        api->set_param(inst, "loopA_decay_rate", "300");
 
         float phase = 0.0f;
         record_full_buffer_loop_a(api, inst, &phase);
-        check(status_is_looping(status_of(api, inst, 'A')), "test12: Looping after buffer-full close");
+        check(status_is_looping(status_of(api, inst, 'A')), "test11: Looping after buffer-full close");
 
-        /* 5 wraps at decay_rate=60 -> expected memory ~= 1 - 5/60 = 91.7%. */
-        long budget = TEST_BUFFER_CAPACITY_FRAMES * 5 + 50000;
-        long advanced = 0;
-        int16_t buf[BLOCK_FRAMES * 2];
-        while (advanced < budget) {
-            fill_silence(buf, BLOCK_FRAMES);
-            api->process_block(inst, buf, BLOCK_FRAMES);
-            check(strcmp(status_of(api, inst, 'A'), "Forgotten") != 0,
-                  "test12: must not reach Forgotten within 5 wraps at the slowest decay_rate");
-            advanced += BLOCK_FRAMES;
-        }
+        /* 60s at decay_rate=300 -> expected memory ~= 1 - 60/300 = 80%. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(60));
+        check(strcmp(status_of(api, inst, 'A'), "Forgotten") != 0,
+              "test11: must not reach Forgotten after only 60s at the slowest decay_rate");
+
         const char *s = status_of(api, inst, 'A');
-        check(status_is_looping(s), "test12: still Looping after 5 wraps at decay_rate=60");
+        check(status_is_looping(s), "test11: still Looping after 60s at decay_rate=300");
         int pct = -1;
         char word[32];
-        check(sscanf(s, "Looping - %d%% (%31[^)])", &pct, word) == 2, "test12: status line parses");
-        check(pct >= 85 && pct <= 95,
-              "test12: memory after 5 wraps at decay_rate=60 is in the expected ~92% neighborhood");
+        check(sscanf(s, "Looping - %d%% (%31[^)])", &pct, word) == 2, "test11: status line parses");
+        check(pct >= 75 && pct <= 85,
+              "test11: memory after 60s at decay_rate=300 is in the expected ~80% neighborhood");
 
         api->destroy_instance(inst);
     }
 
-    /* ---- Test 13: a silence gap mid-recording shorter than silence_timeout
-     * must NOT close the recording — recording resumes and eventually closes
-     * normally once a genuine full-length silence follows. Nothing in
-     * tests 1-10 proves the timeout actually resets when input comes back;
-     * they only prove the two extremes (never silent, or silent long enough
-     * to close). ---- */
+    /* ---- Test 13: erase in the two states 4/5 never exercise (both only
+     * fire while Looping, where erase now fades rather than cuts). The
+     * design doc says erase "works identically regardless of Input Routing
+     * state"; it should also work identically regardless of the loop's OWN
+     * state — Idle and Recording both still clear INSTANTLY, single click,
+     * no fade (nothing to fade for Idle; Recording is an unfinished take
+     * being discarded, not a loop being let go of — see the erase handler
+     * comment in forgetful.c). ---- */
     {
-        void *inst = api->create_instance(".", NULL);
-        check(inst != NULL, "test13: create_instance");
-        api->set_param(inst, "input_routing", TEST_ROUTE_A);
-
-        float phase = 0.0f;
-        run_tone(api, inst, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0, "test13: Recording before the gap");
-
-        /* A gap well under the timeout — must not close. */
-        run_silence(api, inst, TEST_SILENCE_TIMEOUT_FRAMES / 2);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
-              "test13: a silence gap shorter than silence_timeout does not close the recording");
-
-        /* Input resumes: silence_since must reset, not just pause. */
-        run_tone(api, inst, BLOCK_FRAMES * 10, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst, 'A'), "Recording") == 0,
-              "test13: still Recording after input resumes mid-gap");
-
-        /* Now a genuine full timeout: closes normally. */
-        run_silence(api, inst, TEST_SILENCE_TIMEOUT_FRAMES + BLOCK_FRAMES * 4);
-        check(status_is_looping(status_of(api, inst, 'A')),
-              "test13: a full silence_timeout after the resume closes the recording normally");
-
-        api->destroy_instance(inst);
-    }
-
-    /* ---- Test 14: erase in the two states test3/test4 never exercise (both
-     * only fire while Looping). The design doc says erase "works identically
-     * regardless of Input Routing state"; it should also work identically
-     * regardless of the loop's OWN state. ---- */
-    {
-        /* 14a: firing erase on a fresh, empty (Idle) loop must not crash or
-         * misbehave — it arms and then confirms into... still Idle,
-         * harmlessly. */
+        /* 13a: firing erase on a fresh, empty (Ready) loop must not crash or
+         * misbehave — instant no-op clear, still Ready, harmlessly. */
         void *inst_idle = api->create_instance(".", NULL);
-        check(inst_idle != NULL, "test14a: create_instance");
-        check(strcmp(status_of(api, inst_idle, 'A'), STATUS_LISTENING) == 0, "test14a: fresh loop is Idle");
+        check(inst_idle != NULL, "test12a: create_instance");
+        check(strcmp(status_of(api, inst_idle, 'A'), STATUS_READY) == 0, "test12a: fresh loop is Ready");
 
         api->set_param(inst_idle, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst_idle, 'A'), "Tap again") == 0, "test14a: erase arms even on an empty loop");
-        api->set_param(inst_idle, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst_idle, 'A'), "-") == 0, "test14a: confirm clears the arm");
-        check(strcmp(status_of(api, inst_idle, 'A'), STATUS_LISTENING) == 0, "test14a: still Idle, no crash/misbehavior");
+        check(strcmp(erase_readout(api, inst_idle, 'A'), "ERASE") == 0,
+              "test12a: erase readout is always 'ERASE' (not state-aware — no arm/confirm state any more, 2026-08-25 renamed from the idle '-' spelling)");
+        check(strcmp(status_of(api, inst_idle, 'A'), STATUS_READY) == 0, "test12a: still Ready, no crash/misbehavior");
 
         api->destroy_instance(inst_idle);
 
-        /* 14b: firing erase while actively Recording hard-closes it
-         * immediately, discarding whatever was captured so far, rather than
-         * needing to reach Looping first. */
+        /* 13b: firing erase while actively Recording hard-closes it
+         * immediately (no fade — see the erase handler), discarding
+         * whatever was captured so far. */
         void *inst_rec = api->create_instance(".", NULL);
-        check(inst_rec != NULL, "test14b: create_instance");
+        check(inst_rec != NULL, "test12b: create_instance");
         api->set_param(inst_rec, "input_routing", TEST_ROUTE_A);
+        press_record(api, inst_rec);
 
         float phase = 0.0f;
-        run_tone(api, inst_rec, TEST_DEBOUNCE_FRAMES + 20000, 0.5f, 440.0f, &phase);
-        check(strcmp(status_of(api, inst_rec, 'A'), "Recording") == 0, "test14b: Recording before erase");
+        run_tone(api, inst_rec, BLOCK_FRAMES * 20, 0.5f, 440.0f, &phase);
+        check(strcmp(status_of(api, inst_rec, 'A'), "Recording") == 0, "test12b: Recording before erase");
 
         api->set_param(inst_rec, "loopA_erase", "Erase!");
-        check(strcmp(erase_readout(api, inst_rec, 'A'), "Tap again") == 0, "test14b: first click arms while Recording");
-        run_silence(api, inst_rec, BLOCK_FRAMES * 4);
-        api->set_param(inst_rec, "loopA_erase", "Erase!");
-        check(strcmp(status_of(api, inst_rec, 'A'), STATUS_LISTENING) == 0,
-              "test14b: confirmed erase drops a Recording loop straight to Idle, discarding the take");
+        check(strcmp(status_of(api, inst_rec, 'A'), STATUS_READY) == 0,
+              "test12b: single click drops a Recording loop straight to Ready, discarding the take, no fade");
 
         /* A fresh recording can start immediately afterward. */
-        run_tone(api, inst_rec, TEST_DEBOUNCE_FRAMES + BLOCK_FRAMES * 6, 0.5f, 440.0f, &phase);
+        press_record(api, inst_rec);
         check(strcmp(status_of(api, inst_rec, 'A'), "Recording") == 0,
-              "test14b: engine accepts a new recording right after an erase-during-Recording");
+              "test12b: engine accepts a new recording right after an erase-during-Recording");
 
         api->destroy_instance(inst_rec);
     }
 
-    /* ---- Test 15: `state` get/set round-trip — get_param("state") is used
-     * for ordinary slot autosave/patch reload, and nothing exercises it at
-     * all. Confirms: (a) live knobs (decay_rate + the five flavor params,
-     * Master volumes, input_routing) survive a save/restore into a FRESH
-     * instance bit-for-bit, and (b) recorded content/state is deliberately
-     * NOT part of the blob — a Looping source loop must restore into an
-     * Idle destination loop, not some half-restored Looping-with-no-buffer
-     * state, and must not crash doing so. ---- */
+    /* ---- Test 14: `state` get/set round-trip — get_param("state") is used
+     * for ordinary slot autosave/patch reload. Confirms: (a) live knobs
+     * (decay_rate + the five flavor params, Master volumes, input_routing)
+     * survive a save/restore into a FRESH instance bit-for-bit, and (b)
+     * recorded content/state is deliberately NOT part of the blob — a
+     * Looping source loop must restore into a Ready destination loop, not
+     * some half-restored Looping-with-no-buffer state, and must not crash
+     * doing so. ---- */
     {
         void *src = api->create_instance(".", NULL);
-        check(src != NULL, "test15: create_instance src");
+        check(src != NULL, "test13: create_instance src");
 
         float phase = 0.0f;
-        record_full_buffer_loop_a(api, src, &phase); /* gets A into Looping (randomizes flavor on close) */
-        check(status_is_looping(status_of(api, src, 'A')), "test15: src loop A is Looping before save");
+        record_full_buffer_loop_a(api, src, &phase); /* gets A into Looping */
+        check(status_is_looping(status_of(api, src, 'A')), "test13: src loop A is Looping before save");
 
-        /* Flavor knobs are live and override the randomized value
-         * immediately (per the design doc) — set them to known, distinctive
-         * values after the close so the saved blob is deterministic, not
-         * whatever randomize_flavor() happened to draw. */
-        api->set_param(src, "loopA_decay_rate", "45");
+        /* Flavor knobs are plain live values (no randomization since
+         * 2026-08-25) — set to known, distinctive values so the saved blob
+         * is deterministic. decay_rate=120
+         * (seconds) is deliberately outside the OLD 3..60 range, to prove
+         * the wider range round-trips too. */
+        api->set_param(src, "loopA_decay_rate", "120");
         api->set_param(src, "loopA_wow", "0.7");
         api->set_param(src, "loopA_hf_loss", "0.6");
         api->set_param(src, "loopA_hiss", "0.3");
@@ -830,75 +898,71 @@ int main(void) {
 
         char state_json[1024];
         int n = api->get_param(src, "state", state_json, sizeof(state_json));
-        check(n > 0, "test15: state readable");
+        check(n > 0, "test13: state readable");
 
         void *dst = api->create_instance(".", NULL);
-        check(dst != NULL, "test15: create_instance dst");
+        check(dst != NULL, "test13: create_instance dst");
         api->set_param(dst, "state", state_json);
 
         char buf[64];
         api->get_param(dst, "loopA_decay_rate", buf, sizeof(buf));
-        check(strcmp(buf, "45.0") == 0, "test15: decay_rate restored");
+        check(strcmp(buf, "120.0") == 0, "test13: decay_rate restored");
         api->get_param(dst, "loopA_wow", buf, sizeof(buf));
-        check(strcmp(buf, "0.700") == 0, "test15: wow restored");
+        check(strcmp(buf, "0.700") == 0, "test13: wow restored");
         api->get_param(dst, "loopA_hf_loss", buf, sizeof(buf));
-        check(strcmp(buf, "0.600") == 0, "test15: hf_loss restored");
+        check(strcmp(buf, "0.600") == 0, "test13: hf_loss restored");
         api->get_param(dst, "loopA_hiss", buf, sizeof(buf));
-        check(strcmp(buf, "0.300") == 0, "test15: hiss restored");
+        check(strcmp(buf, "0.300") == 0, "test13: hiss restored");
         api->get_param(dst, "loopA_saturation", buf, sizeof(buf));
-        check(strcmp(buf, "0.900") == 0, "test15: saturation restored");
+        check(strcmp(buf, "0.900") == 0, "test13: saturation restored");
         api->get_param(dst, "loopA_chaos", buf, sizeof(buf));
-        check(strcmp(buf, "0.100") == 0, "test15: chaos restored");
+        check(strcmp(buf, "0.100") == 0, "test13: chaos restored");
         api->get_param(dst, "loopB_volume", buf, sizeof(buf));
-        check(strcmp(buf, "0.250") == 0, "test15: Master loop volume restored");
+        check(strcmp(buf, "0.250") == 0, "test13: Master loop volume restored");
         api->get_param(dst, "input_routing", buf, sizeof(buf));
-        check(strcmp(buf, "B") == 0, "test15: input_routing restored");
+        check(strcmp(buf, "B") == 0, "test13: input_routing restored");
 
-        /* The part that must NOT be restored: dst's loop A comes back Idle,
-         * not Looping, even though src's loop A was Looping when the state
-         * was saved — recorded buffer content and playback position are
-         * deliberately outside the `state` blob. */
-        check(strcmp(status_of(api, dst, 'A'), STATUS_LISTENING) == 0,
-              "test15: dst loop A is Idle after restore, not carried over as Looping");
+        /* The part that must NOT be restored: dst's loop A comes back
+         * Ready, not Looping, even though src's loop A was Looping when the
+         * state was saved — recorded buffer content and playback position
+         * are deliberately outside the `state` blob. */
+        check(strcmp(status_of(api, dst, 'A'), STATUS_READY) == 0,
+              "test13: dst loop A is Ready after restore, not carried over as Looping");
 
         api->destroy_instance(src);
         api->destroy_instance(dst);
     }
 
-    /* ---- Test 16: saturation-stage passthrough — the fix in this commit.
-     * Before the fix, sat_amount==0 still ran tanhf(x*1.0f)/tanhf(1.0f),
-     * which is NOT identity — true both at the Warmth knob's literal minimum
-     * AND for a freshly-closed loop (degrade==0) regardless of the Warmth
-     * setting, since sat_amount = saturation * degrade. Uses a
+    /* ---- Test 15: saturation-stage passthrough. sat_amount==0 must be
+     * exact identity — true both at the Warmth/Drive knob's literal minimum
+     * (applied_saturation chases toward 0, so it stays 0) AND for a
+     * freshly-closed loop (applied_saturation starts at 0.0 regardless of
+     * the knob's setting, until the chase has had time to move it). Uses a
      * constant-value recording (not a sine tone) so the recorded content is
-     * known exactly without needing to reconstruct the debounce-triggered
-     * start offset, and drives every other degrade-scaled stage
-     * (wow/hf_loss/hiss/chaos) to zero — set AFTER the buffer-full close,
-     * since randomize_flavor() overwrites them at RECORDING->LOOPING — so
-     * the saturation stage's output is directly recoverable from
+     * known exactly, and drives every other chase-scaled stage
+     * (wow/hf_loss/hiss/chaos) to zero — the saturation stage's output is
+     * directly recoverable from
      * process_block's output samples (dry fed as silence during
      * measurement, so out == mix_dry_wet(0, wet) recovers wet to within
      * int16 rounding). ---- */
     {
-        const int16_t CONST_VALUE = 16000; /* well above record_threshold, no clipping headroom issues */
+        const int16_t CONST_VALUE = 16000;
         const float SAMPLE_F = (float)CONST_VALUE / 32768.0f;
 
-        /* ---- 16a: saturation == 0, at NONZERO degrade (one wrap in) ---- */
+        /* ---- 14a: saturation == 0, at NONZERO degrade (partway decayed) ---- */
         {
             void *inst = api->create_instance(".", NULL);
-            check(inst != NULL, "test16a: create_instance");
+            check(inst != NULL, "test14a: create_instance");
 
             api->set_param(inst, "loopA_decay_rate", "3");
             record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
-            check(status_is_looping(status_of(api, inst, 'A')), "test16a: Looping after buffer-full close");
+            check(status_is_looping(status_of(api, inst, 'A')), "test14a: Looping after buffer-full close");
 
-            /* Set the isolation params AFTER the close (randomize_flavor
-             * already ran). wow=0 makes read speed exactly 1.0, so feeding
-             * exactly recorded_length (== TEST_BUFFER_CAPACITY_FRAMES)
-             * frames of silence advances read_head through EXACTLY one
-             * wrap, deterministically — memory afterward is exactly
-             * 1.0f - 1.0f/decay_rate, matching forgetful.c's own expression
-             * bit for bit. */
+            /* wow=0 makes read speed exactly 1.0. Advancing
+             * exactly 1 second (of the 3s decay_rate) gives a known,
+             * nonzero degrade: memory == 1.0 - 1.0/3.0 exactly, matching
+             * forgetful.c's own per-sample expression bit for bit (no wrap
+             * dependency now — see test3). */
             api->set_param(inst, "loopA_wow", "0");
             api->set_param(inst, "loopA_hf_loss", "0");
             api->set_param(inst, "loopA_hiss", "0");
@@ -906,44 +970,64 @@ int main(void) {
             api->set_param(inst, "loopA_saturation", "0");
             api->set_param(inst, "loopA_volume", "1");
 
-            run_silence(api, inst, TEST_BUFFER_CAPACITY_FRAMES);
+            run_silence(api, inst, TEST_DECAY_FRAMES(1));
             float expected_memory = 1.0f - 1.0f / 3.0f;
-            check(expected_memory > 0.0f && expected_memory < 1.0f, "test16a: sanity — degrade is nonzero here");
+            check(expected_memory > 0.0f && expected_memory < 1.0f, "test14a: sanity — degrade is nonzero here");
 
             int16_t buf[BLOCK_FRAMES * 2];
             fill_silence(buf, BLOCK_FRAMES);
             api->process_block(inst, buf, BLOCK_FRAMES);
 
-            /* Expected: filt_l == SAMPLE_F exactly (hf_loss=0, constant
-             * content); sat_amount = saturation(0) * degrade(nonzero) == 0,
-             * so under the fix sat_l == filt_l exactly regardless of
-             * degrade. */
+            /* Expected: filt_l == SAMPLE_F exactly (hf_loss=0 means
+             * applied_hf_loss's target and chase both stay 0, so the Darken
+             * reverb wash's wet_amount is 0 — exact raw passthrough);
+             * applied_saturation chases toward saturation's target, which
+             * is 0 here, so it stays exactly 0 too regardless of how much
+             * time (and therefore how much memory decay) has elapsed —
+             * sat_l == filt_l exactly.
+             *
+             * Only sample 0 of this block is checked, not all 128: memory
+             * now decays every SAMPLE (not once per wrap), so by the time
+             * this same process_block call reaches sample 127 it has
+             * already decremented memory 127 more times. Sample 0 reads
+             * memory exactly as run_silence left it (LOOPING computes wet
+             * from the CURRENT memory before decrementing it for that
+             * sample), so it is the one sample in the block this single
+             * expected_out value is actually about.
+             *
+             * Tolerance is widened to 20 LSB, not 1: continuous decay means
+             * `expected_memory` is now the result of 44100 sequential
+             * float32 subtractions inside forgetful.c (one per sample of
+             * run_silence(TEST_DECAY_FRAMES(1))) versus ONE subtraction
+             * here, and float32 accumulation error over that many ops is
+             * real (measured ~8 LSB) — not a logic bug, and not something a
+             * bit-exact comparison can distinguish from one. 20 LSB is
+             * still two orders of magnitude tighter than the saturation
+             * bug this test exists to catch, which was 5-15% off (thousands
+             * of LSB), so a regression there still fails loudly. */
             float expected_wet = SAMPLE_F * expected_memory; /* * loop_volume(1) */
             int32_t expected_out = lroundf(expected_wet * 32767.0f);
-            int mismatch = 0;
-            for (int i = 0; i < BLOCK_FRAMES; i++) {
-                if (abs((int)buf[i * 2] - (int)expected_out) > 1) mismatch = 1;
-                if (abs((int)buf[i * 2 + 1] - (int)expected_out) > 1) mismatch = 1;
-            }
-            check(!mismatch,
-                  "test16a: saturation=0 is bit-exact identity even at nonzero degrade "
-                  "(within 1 LSB of independently-computed expected output)");
+            check(abs((int)buf[0] - (int)expected_out) <= 20 &&
+                  abs((int)buf[1] - (int)expected_out) <= 20,
+                  "test14a: saturation=0 is identity even at nonzero degrade "
+                  "(within float32-accumulation tolerance of independently-computed "
+                  "expected output, sample 0)");
 
             api->destroy_instance(inst);
         }
 
-        /* ---- 16b: saturation == 1 (max), at ZERO degrade (freshly closed) ---- */
+        /* ---- 14b: saturation == 1 (max), at ZERO degrade (freshly closed) ---- */
         {
             void *inst = api->create_instance(".", NULL);
-            check(inst != NULL, "test16b: create_instance");
+            check(inst != NULL, "test14b: create_instance");
 
             record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
-            check(status_is_looping(status_of(api, inst, 'A')), "test16b: Looping after buffer-full close");
+            check(status_is_looping(status_of(api, inst, 'A')), "test14b: Looping after buffer-full close");
 
-            /* Set post-close (randomize_flavor already ran) and measure the
-             * very FIRST block — read_head has barely moved, nowhere near a
-             * wrap, so memory is still exactly 1.0 and degrade is exactly
-             * 0.0, regardless of the Warmth knob sitting at its maximum. */
+            /* Measure the
+             * very FIRST block — no time has elapsed, so memory is still
+             * exactly 1.0 and degrade is exactly 0.0, regardless of the
+             * Drive knob sitting at its maximum. */
             api->set_param(inst, "loopA_wow", "0");
             api->set_param(inst, "loopA_hf_loss", "0");
             api->set_param(inst, "loopA_hiss", "0");
@@ -955,19 +1039,226 @@ int main(void) {
             fill_silence(buf, BLOCK_FRAMES);
             api->process_block(inst, buf, BLOCK_FRAMES);
 
-            float expected_wet = SAMPLE_F * 1.0f; /* memory == 1.0, degrade == 0.0 */
+            /* Only sample 0, not the whole block: applied_saturation starts
+             * at 0.0 on close_recording and chases toward the saturation
+             * knob (1.0 here) by one `step` per sample — by sample 127 of
+             * this very block it has already taken ~127 chase steps
+             * (~1.6e-5 at the default 180s decay_rate), enough in principle
+             * to nudge sat_amount off exact 0, though at that magnitude it
+             * wouldn't move a 1-LSB check either. Sample 0 hasn't had this
+             * block's own chase step applied yet (LOOPING computes wet from
+             * the applied_* values before advancing them for that sample,
+             * same as memory), so it is the one sample applied_saturation is
+             * genuinely still 0.0 for regardless of decay_rate. */
+            float expected_wet = SAMPLE_F * 1.0f; /* memory == 1.0, applied_saturation == 0.0 */
             int32_t expected_out = lroundf(expected_wet * 32767.0f);
-            int mismatch = 0;
-            for (int i = 0; i < BLOCK_FRAMES; i++) {
-                if (abs((int)buf[i * 2] - (int)expected_out) > 1) mismatch = 1;
-                if (abs((int)buf[i * 2 + 1] - (int)expected_out) > 1) mismatch = 1;
-            }
-            check(!mismatch,
-                  "test16b: at degrade==0 (freshly closed) output is bit-exact identity "
-                  "even with saturation at its maximum (within 1 LSB)");
+            check(abs((int)buf[0] - (int)expected_out) <= 1 &&
+                  abs((int)buf[1] - (int)expected_out) <= 1,
+                  "test14b: freshly closed (applied_saturation still 0) output is identity "
+                  "even with saturation knob at its maximum (within 1 LSB, sample 0)");
 
             api->destroy_instance(inst);
         }
+    }
+
+    /* ---- Test 15: master_freeze — pauses decay in place while LOOPING,
+     * resumes on a second press. The loop must keep PLAYING (audibly
+     * looping at its currently-reached character) while frozen, just not
+     * progress any further toward Forgotten. ---- */
+    {
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test15: create_instance");
+        api->set_param(inst, "loopA_decay_rate", "3");
+
+        float phase = 0.0f;
+        record_full_buffer_loop_a(api, inst, &phase);
+        check(status_is_looping(status_of(api, inst, 'A')), "test15: Looping after buffer-full close");
+
+        /* Let it decay partway, then freeze. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(1));
+        const char *s = status_of(api, inst, 'A');
+        int pct_before = -1;
+        char word[32];
+        check(sscanf(s, "Looping - %d%% (%31[^)])", &pct_before, word) == 2, "test15: status line parses before freeze");
+
+        /* Readout rebuilt 2026-08-25 onto "what will the NEXT press do":
+         * AGING once frozen (next press would unfreeze, resuming aging) —
+         * was FROZEN under the old "what's happening now" scheme. */
+        api->set_param(inst, "master_freeze", "Freeze!");
+        check(strcmp(freeze_readout(api, inst), "AGING") == 0,
+              "test15: master_freeze reads AGING once pressed");
+
+        /* Run well past when it would otherwise have reached Forgotten
+         * (decay_rate=3s, already ~1s in — without freeze this easily
+         * crosses 0). Memory must not move at all while frozen. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(5));
+        check(status_is_looping(status_of(api, inst, 'A')),
+              "test15: still Looping, not Forgotten, well past decay_rate while frozen");
+        s = status_of(api, inst, 'A');
+        int pct_after = -1;
+        check(sscanf(s, "Looping - %d%% (%31[^)])", &pct_after, word) == 2, "test15: status line parses while frozen");
+        check(pct_after == pct_before,
+              "test15: memory percentage is unchanged after 5s frozen (was stuck at the frame it froze on)");
+
+        /* Unfreeze: decay resumes and the loop eventually reaches Forgotten.
+         * Readout is FREEZE once unfrozen (next press would freeze it
+         * again). */
+        api->set_param(inst, "master_freeze", "Freeze!");
+        check(strcmp(freeze_readout(api, inst), "FREEZE") == 0,
+              "test15: master_freeze reads 'FREEZE' again once resumed");
+
+        long budget = TEST_DECAY_FRAMES(3) + BLOCK_FRAMES * 8;
+        long advanced = 0;
+        int saw_forgotten = 0;
+        int16_t buf[BLOCK_FRAMES * 2];
+        while (advanced < budget && !saw_forgotten) {
+            fill_silence(buf, BLOCK_FRAMES);
+            api->process_block(inst, buf, BLOCK_FRAMES);
+            if (strcmp(status_of(api, inst, 'A'), "Forgotten") == 0) saw_forgotten = 1;
+            advanced += BLOCK_FRAMES;
+        }
+        check(saw_forgotten, "test15: decay resumes after unfreezing and eventually reaches Forgotten");
+
+        api->destroy_instance(inst);
+    }
+
+    /* ---- Test 16: turning a flavor knob live GLIDES to the new target,
+     * it does not snap. Same constant-value / dry-recovery technique as
+     * Test 14: saturation is 0 (and every other chase-scaled stage is 0)
+     * for the first second of a decay_rate=3s loop, so applied_saturation
+     * has settled at exactly 0. The knob is then turned to max — if the
+     * knob write itself moved applied_saturation, the very next sample
+     * would already show full-drive output; instead it must still read as
+     * identity, because only the CHASE TARGET moved. A further second of
+     * decay must then show the output has audibly moved away from
+     * identity, proving the chase is actually advancing toward the new
+     * target rather than being stuck. ---- */
+    {
+        const int16_t CONST_VALUE = 16000;
+        const float SAMPLE_F = (float)CONST_VALUE / 32768.0f;
+
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test16: create_instance");
+
+        api->set_param(inst, "loopA_decay_rate", "3");
+        record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
+        check(status_is_looping(status_of(api, inst, 'A')), "test16: Looping after buffer-full close");
+
+        api->set_param(inst, "loopA_wow", "0");
+        api->set_param(inst, "loopA_hf_loss", "0");
+        api->set_param(inst, "loopA_hiss", "0");
+        api->set_param(inst, "loopA_chaos", "0");
+        api->set_param(inst, "loopA_saturation", "0");
+        api->set_param(inst, "loopA_volume", "1");
+
+        run_silence(api, inst, TEST_DECAY_FRAMES(1));
+
+        /* Turn Warmth to max NOW — applied_saturation is settled at 0 and
+         * must stay there for the very next sample. */
+        api->set_param(inst, "loopA_saturation", "1");
+
+        int16_t buf[BLOCK_FRAMES * 2];
+        fill_silence(buf, BLOCK_FRAMES);
+        api->process_block(inst, buf, BLOCK_FRAMES);
+
+        float expected_memory = 1.0f - 1.0f / 3.0f;
+        float expected_wet = SAMPLE_F * expected_memory;
+        int32_t expected_out = lroundf(expected_wet * 32767.0f);
+        check(abs((int)buf[0] - (int)expected_out) <= 20 &&
+              abs((int)buf[1] - (int)expected_out) <= 20,
+              "test16: turning saturation to max does not snap — sample right "
+              "after the knob write is still identity (within float32-accumulation "
+              "tolerance, sample 0)");
+
+        /* Let the chase run for another second at the new target (2s total
+         * decay now, decay_rate=3s: memory == 1/3, applied_saturation ==
+         * 1/3). Compare against a freshly-computed identity reference AT
+         * THIS memory level (not the stale 1s one above) so the check is
+         * about saturation actually engaging, not just memory's own further
+         * decay — the two pull output in opposite directions (saturation
+         * drives a mid-level constant hard toward full scale; memory keeps
+         * shrinking it), and saturation's pull dominates by roughly 1800
+         * LSB here, far past any decay-alone or accumulation-error
+         * explanation. */
+        run_silence(api, inst, TEST_DECAY_FRAMES(1));
+        fill_silence(buf, BLOCK_FRAMES);
+        api->process_block(inst, buf, BLOCK_FRAMES);
+
+        float expected_memory_2s = 1.0f - 2.0f / 3.0f;
+        int32_t identity_out_2s = lroundf(SAMPLE_F * expected_memory_2s * 32767.0f);
+        check((int)buf[0] - identity_out_2s > 200,
+              "test16: a second later, saturation has audibly engaged — output is "
+              "well above what pure identity-at-this-memory-level would give, "
+              "proving the chase is actually advancing toward the new target");
+
+        api->destroy_instance(inst);
+    }
+
+    /* ---- Test 17: v2 flavor-knob ramp mechanic (2026-08-25) — the FIRST
+     * set_param write to Warp/Darken/Hiss/VINYL since the take started jumps
+     * `applied_X` straight to the new value with NO ramp at all; every write
+     * after that starts a fresh ramp instead, timed to the loop's remaining
+     * time-to-silence (memory*decay_rate), and does NOT jump either. Uses
+     * Darken specifically: its reverb wash is a deterministic function of
+     * applied_hf_loss and the loop's own (constant, known) recorded content,
+     * so "is the wash clearly present" is a reliable proxy for "did
+     * applied_hf_loss actually reach a large value" without needing to
+     * predict exact reverb output samples. ---- */
+    {
+        const int16_t CONST_VALUE = 16000;
+        const float SAMPLE_F = (float)CONST_VALUE / 32768.0f;
+
+        void *inst = api->create_instance(".", NULL);
+        check(inst != NULL, "test17: create_instance");
+
+        api->set_param(inst, "loopA_decay_rate", "20");
+        record_full_buffer_loop_a_constant(api, inst, CONST_VALUE);
+        check(status_is_looping(status_of(api, inst, 'A')), "test17: Looping after buffer-full close");
+
+        /* Lock every other chase-scaled stage off via their own first touch
+         * (each jumps to 0 instantly, same mechanic under test). */
+        api->set_param(inst, "loopA_wow", "0");
+        api->set_param(inst, "loopA_hiss", "0");
+        api->set_param(inst, "loopA_chaos", "0");
+        api->set_param(inst, "loopA_saturation", "0");
+        api->set_param(inst, "loopA_volume", "1");
+
+        int32_t identity = lroundf(SAMPLE_F * 32767.0f);
+        int16_t buf[BLOCK_FRAMES * 2];
+
+        /* FIRST touch on Darken: jumps applied_hf_loss to 0.9 instantly. */
+        api->set_param(inst, "loopA_hf_loss", "0.9");
+        fill_silence(buf, BLOCK_FRAMES);
+        api->process_block(inst, buf, BLOCK_FRAMES);
+        int32_t max_dev_1 = 0;
+        for (int i = 0; i < BLOCK_FRAMES; i++) {
+            int32_t dev = abs((int)buf[i * 2] - identity);
+            if (dev > max_dev_1) max_dev_1 = dev;
+        }
+        check(max_dev_1 > 500,
+              "test17: first touch on Darken snaps instantly — the reverb wash "
+              "is already clearly audible in the very first block, not still "
+              "ramping up from 0 the way an automatic chase would leave it");
+
+        /* SECOND touch on Darken: target changes to 0.0 (fully off). This
+         * must NOT jump — remaining time is ~20s here, so one more block
+         * (128 samples) can only move applied_hf_loss a tiny fraction of the
+         * way toward 0; the wash must still be clearly present. */
+        api->set_param(inst, "loopA_hf_loss", "0.0");
+        fill_silence(buf, BLOCK_FRAMES);
+        api->process_block(inst, buf, BLOCK_FRAMES);
+        int32_t max_dev_2 = 0;
+        for (int i = 0; i < BLOCK_FRAMES; i++) {
+            int32_t dev = abs((int)buf[i * 2] - identity);
+            if (dev > max_dev_2) max_dev_2 = dev;
+        }
+        check(max_dev_2 > 500,
+              "test17: second touch on Darken (to a wildly different target) "
+              "does not snap either — the wash is still clearly present one "
+              "block later, proving it ramps over remaining time rather than "
+              "jumping on every write");
+
+        api->destroy_instance(inst);
     }
 
     if (g_failures > 0) {
@@ -975,12 +1266,12 @@ int main(void) {
         return 1;
     }
     printf("PASS: forgetful LoopEngine bench test "
-           "(chain_params shape, record trigger, decay timing, "
-           "erase double-click/stale-rearm, routing, status-line word "
-           "buckets, Loops Overview format, silence-timeout close, "
-           "too-short blip discard, routing-to-None close, parameter "
-           "clamping, extreme decay_rate, mid-recording silence gap, "
-           "erase during Recording/Idle, state round-trip, saturation "
-           "passthrough)\n");
+           "(chain_params shape, manual record start/stop, decay timing, "
+           "continuous decay, single-click erase fade-out, routing, "
+           "status-line word buckets, Loops Overview format, too-short blip "
+           "discard, parameter clamping, extreme "
+           "decay_rate, erase during Recording/Idle, state round-trip, "
+           "saturation passthrough, master_freeze, flavor-knob chase glide, "
+           "overdub toggle, v2 flavor-ramp first-touch/second-touch)\n");
     return 0;
 }
