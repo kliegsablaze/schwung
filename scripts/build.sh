@@ -525,7 +525,7 @@ else
     echo "Skipping freeverb (up to date)"
 fi
 
-# Build Forgetful audio FX (WIP: Loop A only — docs/plans/forgetful-design.md)
+# Build Forgetful audio FX (docs/plans/forgetful-design.md)
 if needs_rebuild build/modules/audio_fx/forgetful/forgetful.so \
     src/modules/audio_fx/forgetful/dsp/forgetful.c src/host/audio_fx_api_v2.h; then
     echo "Building forgetful..."
@@ -537,6 +537,10 @@ if needs_rebuild build/modules/audio_fx/forgetful/forgetful.so \
 else
     echo "Skipping forgetful (up to date)"
 fi
+# module.json is required for the chain editor's FX picker (scanModulesForType
+# in shadow_ui.js reads modules/audio_fx/<id>/module.json at runtime) — without
+# it forgetful would build and deploy but never appear as a loadable option.
+cp src/modules/audio_fx/forgetful/module.json build/modules/audio_fx/forgetful/
 
 # Build Gesture Test audio FX — a hardware TEST FIXTURE, not a shipped module.
 # Gated on SCHWUNG_BUILD_TEST_MODULES so a release never carries it; set the
