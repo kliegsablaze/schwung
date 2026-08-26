@@ -163,7 +163,6 @@ mkdir -p ./build/lib/
 mkdir -p ./build/licenses/
 mkdir -p ./build/modules/chain/
 mkdir -p ./build/modules/audio_fx/freeverb/
-mkdir -p ./build/modules/audio_fx/forgetful/
 mkdir -p ./build/modules/midi_fx/chord/
 mkdir -p ./build/modules/midi_fx/arp/
 mkdir -p ./build/modules/midi_fx/velocity_scale/
@@ -525,22 +524,9 @@ else
     echo "Skipping freeverb (up to date)"
 fi
 
-# Build Forgetful audio FX (docs/plans/forgetful-design.md)
-if needs_rebuild build/modules/audio_fx/forgetful/forgetful.so \
-    src/modules/audio_fx/forgetful/dsp/forgetful.c src/host/audio_fx_api_v2.h; then
-    echo "Building forgetful..."
-    "${CROSS_PREFIX}gcc" -g -O3 -shared -fPIC \
-        src/modules/audio_fx/forgetful/dsp/forgetful.c \
-        -o build/modules/audio_fx/forgetful/forgetful.so \
-        -Isrc -Isrc/modules/audio_fx/forgetful/dsp \
-        -lm
-else
-    echo "Skipping forgetful (up to date)"
-fi
-# module.json is required for the chain editor's FX picker (scanModulesForType
-# in shadow_ui.js reads modules/audio_fx/<id>/module.json at runtime) — without
-# it forgetful would build and deploy but never appear as a loadable option.
-cp src/modules/audio_fx/forgetful/module.json build/modules/audio_fx/forgetful/
+# Forgetful audio FX moved to its own repo (github.com/kliegsablaze/forgetful)
+# 2026-08-25 — it's an external module now, installed via schwung-manager /
+# the module catalog like any other non-built-in module, not built here.
 
 # Build Gesture Test audio FX — a hardware TEST FIXTURE, not a shipped module.
 # Gated on SCHWUNG_BUILD_TEST_MODULES so a release never carries it; set the
